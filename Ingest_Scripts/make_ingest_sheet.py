@@ -1869,7 +1869,7 @@ def get_parent_domain(
         # Locate parent row and extract the membership column
         id_col = 'identifier' if 'identifier' in ingest_sheet.columns else 'id'
         match = ingest_sheet.loc[
-            ingest_sheet[id_col] == parent_id, 
+            ingest_sheet[id_col] == parent_id,
             'field_domain_access',
         ]
 
