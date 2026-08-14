@@ -1274,7 +1274,7 @@ def get_mapped_field(
         )
 
         return FieldMapping(
-            field=field,
+            field=csv_field,
             taxonomy=None,
             prefix=None,
             repeatable=is_repeatable_field(csv_field),
