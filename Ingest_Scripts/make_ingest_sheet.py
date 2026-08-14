@@ -1338,6 +1338,8 @@ def add_value(
 
     if not value:
         return value
+    
+    unprefixed_value = value
 
     if prefix:
         value = f'{prefix}{value}'
@@ -1350,7 +1352,6 @@ def add_value(
             values.append(value)
     else:
         # Prevent duplicates with and without prefix
-        unprefixed_value = value
         if (
             value not in values
             and unprefixed_value not in values
