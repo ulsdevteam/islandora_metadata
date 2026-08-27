@@ -638,7 +638,10 @@ def merge_sheets(
         raise ValueError(message)
 
     # Remove node_id column from metadata DataFrame, since the Workbench export 
-    # sheet is authoritative for node IDs
+    # sheet is authoritative for node IDs. If a stale or manually-entered
+    # node_id happened to exist in the metadata sheet, dropping it here
+    # guarantees the merge below always uses the export's current value
+    # instead of silently keeping outdated data.
     metadata_df.drop(
         columns=['node_id'],
         errors='ignore',
@@ -1068,6 +1071,8 @@ def remove_pages(
         .str.casefold()
     )
 
+    # As in process_model, a Page object may be represented by either its
+    # taxonomy term name ("Page") or its term ID ("17"), so both are matched.
     page_mask = normalized_models.isin({'page', '17'})
     page_count = int(page_mask.sum())
 
@@ -1118,7 +1123,12 @@ def get_agent_data(
     """
     if not field or '_' not in field:
         return False
-
+    
+    # Agent-related CSV columns follow a "{role}_{agent_type}" naming
+    # convention in the metadata sheet, e.g. "photographer_person" or
+    # "sponsor_corporate". Splitting on the last underscore separates the
+    # relator role (which may itself contain underscores) from the agent
+    # type suffix.
     role_term, agent_type = field.rsplit('_', 1)
     role_term = role_term.replace('_', ' ')
 
@@ -1303,6 +1313,7 @@ def add_value(
     field: str | None,
     value: str,
     prefix: str | None = None,
+    seen_bare_values: dict[str, dict[str, str]] | None = None,
 ) -> str | None:
     """Add a processed value to a record field.
 
@@ -1313,6 +1324,11 @@ def add_value(
         field: Target machine field.
         value: Raw value to add.
         prefix: Optional value prefix.
+        seen_bare_values: Optional per-record tracking dict, mapping each
+            field to a dict of bare (unprefixed) values already stored and
+            the exact string currently holding that value in the record.
+            When both a prefixed and unprefixed form of the same term
+            appear (in either order), the prefixed form is kept.
 
     Returns:
         Processed value added to the record, or None.
@@ -1347,16 +1363,63 @@ def add_value(
     values = record.get(field, [])
 
     if field == 'field_linked_agent':
-        # Prevent duplicates with prefix (names may repeat with different roles)
+        # Linked agents use a different dedup rule than other controlled
+        # fields: the same person/entity name can legitimately appear more
+        # than once, as long as each appearance has a different role prefix
+        # (e.g. "photographer:Jane Doe" and "editor:Jane Doe" are both kept,
+        # since they represent different relationships to the object). Only
+        # an exact repeat of the same prefix + name is treated as a
+        # duplicate.
         if value not in values:
             values.append(value)
     else:
-        # Prevent duplicates with and without prefix
-        if (
-            value not in values
-            and unprefixed_value not in values
-        ):
-            values.append(value)
+        # Prevent duplicates with and without prefix. When the same term
+        # appears both prefixed and unprefixed, keep the prefixed form
+        # regardless of which one arrived first.
+        #
+        # This matters because the same term can reach this function twice
+        # for one record: once bare (e.g. from process_model deriving
+        # "Still Image" directly) and once prefixed (e.g. from a mapped CSV
+        # column that attaches a vocabulary prefix like "resource_type:").
+        # Without this tracking, both forms would be kept as separate list
+        # entries even though they represent the same value, so the field
+        # would end up with a redundant duplicate in the ingest sheet.
+        bare_map = (
+            seen_bare_values.setdefault(field, {})
+            if seen_bare_values is not None
+            else None
+        )
+
+        if bare_map is None:
+            if value not in values and unprefixed_value not in values:
+                values.append(value)
+        else:
+            stored = bare_map.get(unprefixed_value)
+
+            if stored is None:
+                if value not in values:
+                    values.append(value)
+                bare_map[unprefixed_value] = value
+            elif value == stored:
+                pass  # exact duplicate of what's stored; do nothing
+            else:
+                incoming_is_prefixed = value != unprefixed_value
+                stored_is_prefixed = stored != unprefixed_value
+
+                if incoming_is_prefixed and not stored_is_prefixed:
+                    # A bare form is stored; the prefixed form just arrived
+                    # and takes precedence, so replace the bare entry.
+                    try:
+                        idx = values.index(stored)
+                        values[idx] = value
+                    except ValueError:
+                        if value not in values:
+                            values.append(value)
+                    bare_map[unprefixed_value] = value
+                # else: incoming is bare while a prefixed form is already
+                # stored (keep the prefixed form), or both are differently
+                # prefixed variants (keep whichever was seen first) —
+                # either way, drop the incoming value.
 
     record[field] = values
 
@@ -1367,6 +1430,7 @@ def add_title(
     result: ProcessingResult,
     record: dict,
     value: str,
+    seen_bare_values: dict[str, dict[str, str]] | None = None,
 ) -> dict:
     """Add a title value to the record.
 
@@ -1374,12 +1438,14 @@ def add_title(
         result: Runtime processing result.
         record: Record to update.
         value: Title value.
+        seen_bare_values: Optional per-record bare-value tracking dict; see
+            `add_value`.
 
     Returns:
         Updated record.
     """
-    add_value(result, record, None, 'title', value)
-    add_value(result, record, None, 'field_full_title', value)
+    add_value(result, record, None, 'title', value, seen_bare_values=seen_bare_values)
+    add_value(result, record, None, 'field_full_title', value, seen_bare_values=seen_bare_values)
 
     return record
 
@@ -1388,6 +1454,7 @@ def process_title(
     result: ProcessingResult,
     record: dict,
     title_parts: dict,
+    seen_bare_values: dict[str, dict[str, str]] | None = None,
 ) -> str | None:
     """Build and add a formatted title from title parts.
 
@@ -1395,6 +1462,8 @@ def process_title(
         result: Runtime processing result.
         record: Record being updated.
         title_parts: Title components.
+        seen_bare_values: Optional per-record bare-value tracking dict; see
+            `add_value`.
 
     Returns:
         Formatted title, if created.
@@ -1408,7 +1477,7 @@ def process_title(
         if title_parts.get('number'):
             title += f", no. {title_parts.get('number')}"
 
-        add_title(result, record, title)
+        add_title(result, record, title, seen_bare_values=seen_bare_values)
 
     return title
 
@@ -1801,12 +1870,23 @@ def validate_record(
     for field in MANDATORY_FIELDS:
         parent_id = record.get('parent_id')
 
+        # Child records (records with a parent_id, e.g. individual pages
+        # within a Paged Content object) are held to different mandatory
+        # field rules than top-level objects, since they inherit context
+        # from their parent rather than needing it stated independently:
         if parent_id:
             parent_id = parent_id[0]
 
+            # A child with no title of its own is given a fallback title
+            # equal to its own identifier, rather than being flagged as
+            # missing a required field.
             if field == 'title' and not record[field]:
                 add_value(result, record, None, 'title', pid)
 
+            # Domain access isn't set independently per child; it's
+            # inherited from whichever domain(s) the parent object belongs
+            # to, so children stay visible on the same site(s) as their
+            # parent.
             elif field == 'field_domain_access' and not record[field]:
                 parent_domains = get_parent_domain(
                     ingest_sheet,
@@ -1867,9 +1947,13 @@ def get_parent_domain(
     parent_domains = []
 
     try:
+        id_column = (
+            'identifier' if 'identifier' in ingest_sheet.columns else 'id'
+        )
+        
         # Locate parent row and extract the membership column
         match = ingest_sheet.loc[
-            ingest_sheet[pid] == parent_id,
+            ingest_sheet[id_column] == parent_id,
             'field_domain_access',
         ]
 
@@ -1891,6 +1975,7 @@ def process_model(
     record: dict,
     field: str,
     value: str,
+    seen_bare_values: dict[str, dict[str, str]] | None = None,
 ) -> bool:
     """Validate and process an object model.
 
@@ -1899,11 +1984,19 @@ def process_model(
         record: Record being processed.
         field: Source field name.
         value: Object model value.
+        seen_bare_values: Optional per-record bare-value tracking dict; see
+            `add_value`.
 
     Returns:
         True if model is valid; otherwise False.
     """
     pid = record['id'][0]
+    
+    # Source data may supply either the model's display name (e.g. "Page")
+    # or its taxonomy term ID (e.g. "17") - both are valid inputs throughout
+    # this pipeline (see also the similar name-or-ID check in remove_pages).
+    # Try the name first, since that's the common case, then fall back to
+    # resolving a term ID to its name via the taxonomy lookup.
     model_mapping = MODEL_MAPPING.get(value)
 
     if not model_mapping:
@@ -1933,6 +2026,7 @@ def process_model(
         field,
         'field_resource_type',
         resource_type,
+        seen_bare_values=seen_bare_values,
     )
 
     display_hint = model_mapping.get('display_hint')
@@ -1942,6 +2036,7 @@ def process_model(
         field,
         'field_display_hints',
         display_hint,
+        seen_bare_values=seen_bare_values,
     )
 
     return True
@@ -1966,6 +2061,7 @@ def process_record(
     """
     # Setup record
     record = initialize_record()
+    seen_bare_values: dict[str, dict[str, str]] = {}
 
     # Find the first key that exists in the row's index
     valid_key = next((k for k in IDENTIFIERS if k in row.index), None)
@@ -1985,7 +2081,7 @@ def process_record(
         return None
 
     try:
-        add_value(result, record, None, 'id', str(pid))
+        add_value(result, record, None, 'id', str(pid), seen_bare_values=seen_bare_values)
 
         # Process values in each field
         title_parts = {}
@@ -2020,7 +2116,7 @@ def process_record(
                     continue
 
                 if mapping.field == 'field_model':
-                    process_model(result, record, csv_field, value)
+                    process_model(result, record, csv_field, value, seen_bare_values=seen_bare_values)
                 elif mapping.field == 'field_member_of':
                     validate_collection_id(result, pid, value)
                 elif mapping.field == 'field_domain_access':
@@ -2046,9 +2142,10 @@ def process_record(
                         mapping.field,
                         value,
                         mapping.prefix,
+                        seen_bare_values=seen_bare_values,
                     )
 
-        process_title(result, record, title_parts)
+        process_title(result, record, title_parts, seen_bare_values=seen_bare_values)
 
     except Exception:
         logging.getLogger(LOGGER_NAME).exception(
