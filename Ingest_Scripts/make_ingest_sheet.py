@@ -62,6 +62,7 @@ from tqdm import tqdm
 
 # Local imports
 from definitions import (
+    COMMA_DELIMITED_FIELDS,
     CONTROLLED_FIELDS,
     DATE_FIELDS,
     DISALLOWED_FIELDS_BY_INGEST_TASK,
@@ -929,11 +930,14 @@ def initialize_record() -> dict:
     }
 
 
-def split_and_clean(text: str) -> list[str]:
+def split_and_clean(text: str, extra_delimiters: str = '') -> list[str]:
     """Tokenize a string by pipe and semi-colon delimiters.
 
     Args:
         text: Raw input string.
+        extra_delimiters: Additional single-character delimiters to split
+            on, beyond the default pipe and semicolon (e.g. ',' for fields
+            populated via a comma-joined multi-select dropdown).
 
     Returns:
         Cleaned list of non-empty values.
@@ -941,8 +945,10 @@ def split_and_clean(text: str) -> list[str]:
     if not text:
         return []
 
-    # Split on pipe or semicolon plus any surrounding whitespace
-    parts = re.split(r'\s*[|;]\s*', text)
+    # Split on pipe or semicolon, or any extra delimiters, plus any surrounding 
+    # whitespace
+    delimiter_chars = '|;' + extra_delimiters
+    parts = re.split(rf'\s*[{re.escape(delimiter_chars)}]\s*', text)
 
     # Clean up individual parts and filter out empty strings
     return [
@@ -1875,7 +1881,13 @@ def get_parent_domain(
 
         # Tokenize the URIs
         if not match.empty and pd.notna(match.values[0]):
-            parent_domains = split_and_clean(str(match.values[0]))
+            extra_delimiters = (
+                ',' if 'field_domain_access' in COMMA_DELIMITED_FIELDS else ''
+            )
+            parent_domains = split_and_clean(
+                str(match.values[0]),
+                extra_delimiters=extra_delimiters,
+            )
 
     except Exception:
         logging.getLogger(LOGGER_NAME).exception(
@@ -2006,7 +2018,10 @@ def process_record(
                 continue
 
             if mapping.repeatable:
-                values = split_and_clean(data)
+                extra_delimiters = (
+                    ',' if mapping.field in COMMA_DELIMITED_FIELDS else ''
+                )
+                values = split_and_clean(data, extra_delimiters=extra_delimiters)
             elif mapping.field in FORMATTED_FIELDS:
                 cleaned = remove_whitespaces(data, allow_newlines=True)
                 values = [cleaned] if cleaned else []
