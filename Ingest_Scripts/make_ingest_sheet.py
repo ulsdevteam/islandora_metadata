@@ -1313,7 +1313,6 @@ def add_value(
     field: str | None,
     value: str,
     prefix: str | None = None,
-    seen_bare_values: dict[str, dict[str, str]] | None = None,
 ) -> str | None:
     """Add a processed value to a record field.
 
@@ -1324,11 +1323,6 @@ def add_value(
         field: Target machine field.
         value: Raw value to add.
         prefix: Optional value prefix.
-        seen_bare_values: Optional per-record tracking dict, mapping each
-            field to a dict of bare (unprefixed) values already stored and
-            the exact string currently holding that value in the record.
-            When both a prefixed and unprefixed form of the same term
-            appear (in either order), the prefixed form is kept.
 
     Returns:
         Processed value added to the record, or None.
@@ -1381,46 +1375,34 @@ def add_value(
         # for one record: once bare (e.g. from process_model deriving
         # "Still Image" directly) and once prefixed (e.g. from a mapped CSV
         # column that attaches a vocabulary prefix like "resource_type:").
-        # Without this tracking, both forms would be kept as separate list
-        # entries even though they represent the same value, so the field
-        # would end up with a redundant duplicate in the ingest sheet.
-        bare_map = (
-            seen_bare_values.setdefault(field, {})
-            if seen_bare_values is not None
-            else None
+        #
+        # Every controlled field's prefix has a single trailing colon
+        # (e.g. "resource_types:"), and the prefix never contains a colon
+        # other than the trailing colon, so a stored entry's bare term can 
+        # be recovered just by splitting off everything after the first colon.
+  
+        def bare_form(entry: str) -> str:
+            return entry.rsplit(':', 1)[-1] if ':' in entry else entry
+
+        stored = next(
+            (v for v in values if bare_form(v) == unprefixed_value),
+            None,
         )
 
-        if bare_map is None:
-            if value not in values and unprefixed_value not in values:
-                values.append(value)
-        else:
-            stored = bare_map.get(unprefixed_value)
+        if stored is None:
+            values.append(value)
+        elif value != stored:
+            incoming_is_prefixed = value != unprefixed_value
+            stored_is_prefixed = stored != unprefixed_value
 
-            if stored is None:
-                if value not in values:
-                    values.append(value)
-                bare_map[unprefixed_value] = value
-            elif value == stored:
-                pass  # exact duplicate of what's stored; do nothing
-            else:
-                incoming_is_prefixed = value != unprefixed_value
-                stored_is_prefixed = stored != unprefixed_value
-
-                if incoming_is_prefixed and not stored_is_prefixed:
-                    # A bare form is stored; the prefixed form just arrived
-                    # and takes precedence, so replace the bare entry.
-                    try:
-                        idx = values.index(stored)
-                        values[idx] = value
-                    except ValueError:
-                        if value not in values:
-                            values.append(value)
-                    bare_map[unprefixed_value] = value
-                # else: incoming is bare while a prefixed form is already
-                # stored (keep the prefixed form), or both are differently
-                # prefixed variants (keep whichever was seen first) —
-                # either way, drop the incoming value.
-
+            if incoming_is_prefixed and not stored_is_prefixed:
+                # A bare form is stored; the prefixed form just arrived
+                # and takes precedence, so replace the bare entry.
+                values[values.index(stored)] = value
+            # else: incoming is bare while a prefixed form is already
+            # stored (keep the prefixed form), or both are differently
+            # prefixed variants (keep whichever was seen first) —
+            # either way, drop the incoming value.
     record[field] = values
 
     return value
@@ -1430,7 +1412,6 @@ def add_title(
     result: ProcessingResult,
     record: dict,
     value: str,
-    seen_bare_values: dict[str, dict[str, str]] | None = None,
 ) -> dict:
     """Add a title value to the record.
 
@@ -1438,14 +1419,12 @@ def add_title(
         result: Runtime processing result.
         record: Record to update.
         value: Title value.
-        seen_bare_values: Optional per-record bare-value tracking dict; see
-            `add_value`.
 
     Returns:
         Updated record.
     """
-    add_value(result, record, None, 'title', value, seen_bare_values=seen_bare_values)
-    add_value(result, record, None, 'field_full_title', value, seen_bare_values=seen_bare_values)
+    add_value(result, record, None, 'title', value)
+    add_value(result, record, None, 'field_full_title', value)
 
     return record
 
@@ -1454,7 +1433,6 @@ def process_title(
     result: ProcessingResult,
     record: dict,
     title_parts: dict,
-    seen_bare_values: dict[str, dict[str, str]] | None = None,
 ) -> str | None:
     """Build and add a formatted title from title parts.
 
@@ -1462,8 +1440,6 @@ def process_title(
         result: Runtime processing result.
         record: Record being updated.
         title_parts: Title components.
-        seen_bare_values: Optional per-record bare-value tracking dict; see
-            `add_value`.
 
     Returns:
         Formatted title, if created.
@@ -1477,7 +1453,7 @@ def process_title(
         if title_parts.get('number'):
             title += f", no. {title_parts.get('number')}"
 
-        add_title(result, record, title, seen_bare_values=seen_bare_values)
+        add_title(result, record, title)
 
     return title
 
@@ -1975,7 +1951,6 @@ def process_model(
     record: dict,
     field: str,
     value: str,
-    seen_bare_values: dict[str, dict[str, str]] | None = None,
 ) -> bool:
     """Validate and process an object model.
 
@@ -1984,8 +1959,6 @@ def process_model(
         record: Record being processed.
         field: Source field name.
         value: Object model value.
-        seen_bare_values: Optional per-record bare-value tracking dict; see
-            `add_value`.
 
     Returns:
         True if model is valid; otherwise False.
@@ -2026,7 +1999,6 @@ def process_model(
         field,
         'field_resource_type',
         resource_type,
-        seen_bare_values=seen_bare_values,
     )
 
     display_hint = model_mapping.get('display_hint')
@@ -2036,7 +2008,6 @@ def process_model(
         field,
         'field_display_hints',
         display_hint,
-        seen_bare_values=seen_bare_values,
     )
 
     return True
@@ -2061,7 +2032,6 @@ def process_record(
     """
     # Setup record
     record = initialize_record()
-    seen_bare_values: dict[str, dict[str, str]] = {}
 
     # Find the first key that exists in the row's index
     valid_key = next((k for k in IDENTIFIERS if k in row.index), None)
@@ -2081,7 +2051,7 @@ def process_record(
         return None
 
     try:
-        add_value(result, record, None, 'id', str(pid), seen_bare_values=seen_bare_values)
+        add_value(result, record, None, 'id', str(pid))
 
         # Process values in each field
         title_parts = {}
@@ -2116,7 +2086,7 @@ def process_record(
                     continue
 
                 if mapping.field == 'field_model':
-                    process_model(result, record, csv_field, value, seen_bare_values=seen_bare_values)
+                    process_model(result, record, csv_field, value)
                 elif mapping.field == 'field_member_of':
                     validate_collection_id(result, pid, value)
                 elif mapping.field == 'field_domain_access':
@@ -2142,10 +2112,9 @@ def process_record(
                         mapping.field,
                         value,
                         mapping.prefix,
-                        seen_bare_values=seen_bare_values,
                     )
 
-        process_title(result, record, title_parts, seen_bare_values=seen_bare_values)
+        process_title(result, record, title_parts)
 
     except Exception:
         logging.getLogger(LOGGER_NAME).exception(
