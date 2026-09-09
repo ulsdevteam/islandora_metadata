@@ -638,7 +638,10 @@ def merge_sheets(
         raise ValueError(message)
 
     # Remove node_id column from metadata DataFrame, since the Workbench export 
-    # sheet is authoritative for node IDs
+    # sheet is authoritative for node IDs. If a stale or manually-entered
+    # node_id happened to exist in the metadata sheet, dropping it here
+    # guarantees the merge below always uses the export's current value
+    # instead of silently keeping outdated data.
     metadata_df.drop(
         columns=['node_id'],
         errors='ignore',
@@ -1068,6 +1071,8 @@ def remove_pages(
         .str.casefold()
     )
 
+    # As in process_model, a Page object may be represented by either its
+    # taxonomy term name ("Page") or its term ID ("17"), so both are matched.
     page_mask = normalized_models.isin({'page', '17'})
     page_count = int(page_mask.sum())
 
@@ -1118,7 +1123,12 @@ def get_agent_data(
     """
     if not field or '_' not in field:
         return False
-
+    
+    # Agent-related CSV columns follow a "{role}_{agent_type}" naming
+    # convention in the metadata sheet, e.g. "photographer_person" or
+    # "sponsor_corporate". Splitting on the last underscore separates the
+    # relator role (which may itself contain underscores) from the agent
+    # type suffix.
     role_term, agent_type = field.rsplit('_', 1)
     role_term = role_term.replace('_', ' ')
 
@@ -1338,6 +1348,8 @@ def add_value(
 
     if not value:
         return value
+    
+    unprefixed_value = value
 
     if prefix:
         value = f'{prefix}{value}'
@@ -1345,18 +1357,52 @@ def add_value(
     values = record.get(field, [])
 
     if field == 'field_linked_agent':
-        # Prevent duplicates with prefix (names may repeat with different roles)
+        # Linked agents use a different dedup rule than other controlled
+        # fields: the same person/entity name can legitimately appear more
+        # than once, as long as each appearance has a different role prefix
+        # (e.g. "photographer:Jane Doe" and "editor:Jane Doe" are both kept,
+        # since they represent different relationships to the object). Only
+        # an exact repeat of the same prefix + name is treated as a
+        # duplicate.
         if value not in values:
             values.append(value)
     else:
-        # Prevent duplicates with and without prefix
-        unprefixed_value = value
-        if (
-            value not in values
-            and unprefixed_value not in values
-        ):
-            values.append(value)
+        # Prevent duplicates with and without prefix. When the same term
+        # appears both prefixed and unprefixed, keep the prefixed form
+        # regardless of which one arrived first.
+        #
+        # This matters because the same term can reach this function twice
+        # for one record: once bare (e.g. from process_model deriving
+        # "Still Image" directly) and once prefixed (e.g. from a mapped CSV
+        # column that attaches a vocabulary prefix like "resource_type:").
+        #
+        # Every controlled field's prefix has a single trailing colon
+        # (e.g. "resource_types:"), and the prefix never contains a colon
+        # other than the trailing colon, so a stored entry's bare term can 
+        # be recovered just by splitting off everything after the first colon.
+  
+        def bare_form(entry: str) -> str:
+            return entry.rsplit(':', 1)[-1] if ':' in entry else entry
 
+        stored = next(
+            (v for v in values if bare_form(v) == unprefixed_value),
+            None,
+        )
+
+        if stored is None:
+            values.append(value)
+        elif value != stored:
+            incoming_is_prefixed = value != unprefixed_value
+            stored_is_prefixed = stored != unprefixed_value
+
+            if incoming_is_prefixed and not stored_is_prefixed:
+                # A bare form is stored; the prefixed form just arrived
+                # and takes precedence, so replace the bare entry.
+                values[values.index(stored)] = value
+            # else: incoming is bare while a prefixed form is already
+            # stored (keep the prefixed form), or both are differently
+            # prefixed variants (keep whichever was seen first) —
+            # either way, drop the incoming value.
     record[field] = values
 
     return value
@@ -1800,12 +1846,23 @@ def validate_record(
     for field in MANDATORY_FIELDS:
         parent_id = record.get('parent_id')
 
+        # Child records (records with a parent_id, e.g. individual pages
+        # within a Paged Content object) are held to different mandatory
+        # field rules than top-level objects, since they inherit context
+        # from their parent rather than needing it stated independently:
         if parent_id:
             parent_id = parent_id[0]
 
+            # A child with no title of its own is given a fallback title
+            # equal to its own identifier, rather than being flagged as
+            # missing a required field.
             if field == 'title' and not record[field]:
                 add_value(result, record, None, 'title', pid)
 
+            # Domain access isn't set independently per child; it's
+            # inherited from whichever domain(s) the parent object belongs
+            # to, so children stay visible on the same site(s) as their
+            # parent.
             elif field == 'field_domain_access' and not record[field]:
                 parent_domains = get_parent_domain(
                     ingest_sheet,
@@ -1866,10 +1923,13 @@ def get_parent_domain(
     parent_domains = []
 
     try:
+        id_column = (
+            'identifier' if 'identifier' in ingest_sheet.columns else 'id'
+        )
+        
         # Locate parent row and extract the membership column
-        id_col = 'identifier' if 'identifier' in ingest_sheet.columns else 'id'
         match = ingest_sheet.loc[
-            ingest_sheet[id_col] == parent_id,
+            ingest_sheet[id_column] == parent_id,
             'field_domain_access',
         ]
 
@@ -1904,6 +1964,12 @@ def process_model(
         True if model is valid; otherwise False.
     """
     pid = record['id'][0]
+    
+    # Source data may supply either the model's display name (e.g. "Page")
+    # or its taxonomy term ID (e.g. "17") - both are valid inputs throughout
+    # this pipeline (see also the similar name-or-ID check in remove_pages).
+    # Try the name first, since that's the common case, then fall back to
+    # resolving a term ID to its name via the taxonomy lookup.
     model_mapping = MODEL_MAPPING.get(value)
 
     if not model_mapping:

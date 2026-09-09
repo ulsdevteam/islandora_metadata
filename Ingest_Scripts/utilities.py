@@ -43,7 +43,12 @@ WARNING_SYMBOL = f"{YELLOW}[!]{RESET}"
 ERROR_SYMBOL = f"{RED}[X]{RESET}"
 TRANSFORM_SYMBOL = f"{CYAN}[*]{RESET}"
 
-# Status symbols
+# Matches Drupal's extended EDTF date range format, which the standard
+# `edtf` library's parser doesn't recognize. These dates use a partial-
+# century/decade placeholder like "19XX" or "197X" as one or both ends of a
+# range, e.g. "19XX/2004", "197X/18XX?", or "19XX/.." (open-ended). Dates
+# matching this pattern are accepted as valid even though parse_edtf() will
+# raise on them.
 DRUPAL_EXTENDED_EDTF_PATTERN = re.compile(
     r'^'
     r'\d{1,3}X{1,3}'
