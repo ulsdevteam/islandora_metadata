@@ -15,14 +15,16 @@ Usage:
         --user_id abc123 \
         --ingest_task create \
         --batch_path /workbench/batches/example \
-        --metadata_id <metadata_sheet_id>
+        --metadata_id <metadata_sheet_id> \
+        --id-column identifier
 
     # Update existing objects using local spreadsheets
     python3 make_ingest_sheet.py \
         --ingest_task update \
         --batch_path /workbench/batches/example \
         --export_sheet /workbench/batches/example/export/example.csv \
-        --metadata_sheet /workbench/batches/example/metadata.csv
+        --metadata_sheet /workbench/batches/example/metadata.csv \
+        --id-column identifier
 
     # Publish existing objects
     python3 make_ingest_sheet.py \
@@ -30,7 +32,8 @@ Usage:
         --metadata_level publish \
         --publish y \
         --batch_path /workbench/batches/example \
-        --metadata_id <metadata_sheet_id>
+        --metadata_id <metadata_sheet_id> \
+        --id-column identifier
 
     # Run interactively
     python3 make_ingest_sheet.py
@@ -70,7 +73,6 @@ from definitions import (
     FIELDS,
     FORMATTED_FIELDS,
     GOOGLE_CREDENTIALS_FILE,
-    IDENTIFIERS,
     LINKED_AGENT_TYPES,
     MANDATORY_FIELDS,
     MANIFEST_FIELD_MAPPING,
@@ -127,6 +129,7 @@ class AppConfig:
     batch_size: int
     export_id: str | None
     metadata_id: str | None
+    id_column: str
     credentials_file: str
     ingest_task: str
     metadata_level: str
@@ -340,6 +343,11 @@ def parse_arguments() -> AppConfig:
         help="Path to metadata sheet on local device.",
     )
     parser.add_argument(
+        '--id_column',
+        type=str,
+        help="Metadata sheet column that contains the record identifier."
+    )
+    parser.add_argument(
         '-c',
         '--credentials_file',
         type=str,
@@ -389,6 +397,11 @@ def parse_arguments() -> AppConfig:
     if not args.metadata_id and not args.metadata_sheet:
         args.metadata_id = prompt_for_input(
             "Enter the Google Sheet ID for the metadata sheet: "
+        )
+        
+    if not args.id_column:
+        args.id_column = prompt_for_input(
+            "Enter the metadata sheet column name used as the identifier: "
         )
 
     if not args.metadata_level:
