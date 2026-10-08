@@ -243,6 +243,24 @@ class ProcessingResult:
         self.current_batch += 1
 
 
+class PrefixedValue(str):
+    """String that remembers the vocabulary prefix and bare term it holds.
+ 
+    Behaves exactly like the combined string (``prefix + term``) for joining,
+    comparison, and output, but keeps the two parts separate so that
+    de-duplication never has to guess where a prefix ends. Parsing the
+    combined string by splitting on ``:`` is unreliable because the bare term
+    itself may contain colons (e.g. ``Sound recording: musical``).
+    """
+ 
+    def __new__(cls, term: str, prefix: str | None = None):
+        prefix = prefix or ''
+        obj = super().__new__(cls, f'{prefix}{term}')
+        obj.term = term
+        obj.prefix = prefix
+        return obj
+
+
 @dataclass(frozen=True)
 class FieldMapping:
     """Islandora field mapping information for a source CSV field."""
@@ -1382,16 +1400,17 @@ def add_value(
         # "Still Image" directly) and once prefixed (e.g. from a mapped CSV
         # column that attaches a vocabulary prefix like "resource_type:").
         #
-        # Every controlled field's prefix has a single trailing colon
-        # (e.g. "resource_types:"), and the prefix never contains a colon
-        # other than the trailing colon, so a stored entry's bare term can 
-        # be recovered just by splitting off everything after the first colon.
-  
-        def bare_form(entry: str) -> str:
-            return entry.rsplit(':', 1)[-1] if ':' in entry else entry
+        # Stored entries are PrefixedValue objects, which carry their bare
+        # term and prefix separately. Entries are compared on the bare term
+        # directly rather than by parsing the combined string, so terms that
+        # themselves contain colons are handled correctly.
+        value = PrefixedValue(unprefixed_value, prefix)
 
         stored = next(
-            (v for v in values if bare_form(v) == unprefixed_value),
+            (
+                v for v in values 
+                if getattr(v, 'term', v) == unprefixed_value
+            ),
             None,
         )
 
