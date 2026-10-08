@@ -77,7 +77,6 @@ from definitions import (
     MARC_FIELD_MAPPING,
     MINIMAL_METADATA_FIELDS,
     MODEL_MAPPING,
-    METADATA_REQUIRED_FIELDS,
     PUBLISH_FIELDS,
     RELATOR_TERMS,
     SCAN_BATCH_DIR_FIELDS,
@@ -1885,10 +1884,11 @@ def validate_record(
             # to, so children stay visible on the same site(s) as their
             # parent.
             elif field == 'field_domain_access' and not record[field]:
-                parent_domains = get_parent_domain(
+                parent_domains = get_parent_values(
                     ingest_sheet,
                     pid,
                     parent_id,
+                    'field_domain_access',
                 )
 
                 for domain in parent_domains:
@@ -1899,9 +1899,29 @@ def validate_record(
                         'field_domain_access',
                         domain,
                     )
+                    
+            # The depositor isn't set independently per child either; it's
+            # inherited from the parent object, so a child is attributed to
+            # the same depositor as its parent.
+            elif field == 'field_depositor' and not record[field]:
+                parent_depositors = get_parent_values(
+                    ingest_sheet,
+                    pid,
+                    parent_id,
+                    'field_depositor',
+                )
+
+                for depositor in parent_depositors:
+                    add_value(
+                        result,
+                        record,
+                        None,
+                        'field_depositor',
+                        depositor,
+                    )
 
             # Skip since children do not get collection associations
-            elif field in METADATA_REQUIRED_FIELDS:
+            elif field == 'field_member_of':
                 continue
 
         missing_value = len(record[field]) < 1
@@ -1926,51 +1946,55 @@ def validate_record(
 
 # --- Field-Specific Processing ---
 
-def get_parent_domain(
+def get_parent_values(
     ingest_sheet: pd.DataFrame,
     pid: str,
     parent_id: str,
+    column: str,
 ) -> list[str]:
-    """Inherit domain access values from a parent record.
+    """Inherit the values of a field from a parent record.
 
     Args:
         ingest_sheet: Master ingest DataFrame.
         pid: PID of the current child record.
         parent_id: PID of the parent record.
+        column: Ingest sheet column to read from the parent row (e.g.
+            ``field_domain_access`` or ``field_depositor``).
 
     Returns:
-        Parent domain values, if found.
+        Parent values for the column, if found.
     """
-    parent_domains = []
+    parent_values = []
 
     try:
         id_column = (
             'identifier' if 'identifier' in ingest_sheet.columns else 'id'
         )
         
-        # Locate parent row and extract the membership column
+        # Locate parent row and extract the requested column
         match = ingest_sheet.loc[
             ingest_sheet[id_column] == parent_id,
-            'field_domain_access',
+            column,
         ]
 
-        # Tokenize the URIs
+        # Tokenize the values
         if not match.empty and pd.notna(match.values[0]):
             extra_delimiters = (
-                ',' if 'field_domain_access' in COMMA_DELIMITED_FIELDS else ''
+                ',' if column in COMMA_DELIMITED_FIELDS else ''
             )
-            parent_domains = split_and_clean(
+            parent_values = split_and_clean(
                 str(match.values[0]),
                 extra_delimiters=extra_delimiters,
             )
 
     except Exception:
         logging.getLogger(LOGGER_NAME).exception(
-            "Record %s: Failed to retrieve parent domain.",
+            "Record %s: Failed to retrieve parent %s.",
             pid,
+            column,
         )
 
-    return parent_domains
+    return parent_values
 
 
 def process_model(
