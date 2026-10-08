@@ -131,6 +131,15 @@ FORMATTED_FIELDS = {
     'tableOfContents'
 }
 
+# Repeatable fields whose source cells may use a comma as an additional
+# value delimiter, e.g. values entered via a multi-select dropdown in
+# Google Sheets (which joins selections with ", "). These are handled
+# separately from the default pipe/semicolon delimiters used elsewhere,
+# since a bare comma is also valid punctuation in many other free-text
+# repeatable fields (subjects, addresses, citations, etc.).
+COMMA_DELIMITED_FIELDS = {
+    'field_domain_access',
+}
 
 # --- Ignored Fields During Processing ---
 
