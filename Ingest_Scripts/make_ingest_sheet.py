@@ -343,9 +343,9 @@ def parse_arguments() -> AppConfig:
         help="Path to metadata sheet on local device.",
     )
     parser.add_argument(
-        '--id_column',
+        '--id-column',
         type=str,
-        help="Metadata sheet column that contains the record identifier."
+        help="Metadata sheet column that contains the record identifier.",
     )
     parser.add_argument(
         '-c',
@@ -398,7 +398,7 @@ def parse_arguments() -> AppConfig:
         args.metadata_id = prompt_for_input(
             "Enter the Google Sheet ID for the metadata sheet: "
         )
-        
+
     if not args.id_column:
         args.id_column = prompt_for_input(
             "Enter the metadata sheet column name used as the identifier: "
@@ -489,20 +489,42 @@ def load_input_sheets(config: AppConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 # --- Sheet Merging ---
 
+def validate_id_column(metadata_df: pd.DataFrame, id_column: str) -> None:
+    """Confirm that the metadata sheet contains the identifier column.
+
+    Args:
+        metadata_df: Human-editable metadata sheet.
+        id_column: Name of the column that holds the record identifier.
+
+    Raises:
+        ValueError: If the column is not in the metadata sheet.
+    """
+    if id_column not in metadata_df.columns:
+        available = ', '.join(map(str, metadata_df.columns))
+        message = (
+            f"Identifier column '{id_column}' was not found in the metadata "
+            f"sheet. Available columns: {available}"
+        )
+        logging.getLogger(LOGGER_NAME).error(message)
+        raise ValueError(message)
+
+
 def merge_sheets(
     export_df: pd.DataFrame,
     metadata_df: pd.DataFrame,
+    id_column: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Add Workbench node IDs to a metadata sheet.
 
     The metadata sheet is treated as the authoritative source. The export
     sheet contributes only the system-generated ``node_id``, matched using the
-    export's ``id`` column and either ``identifier`` or ``id`` in the metadata
-    sheet. The metadata sheet's original identifier column name is preserved.
+    export's ``id`` column and the metadata sheet's ``id_column``. The metadata
+    sheet's original identifier column name is preserved.
 
     Args:
         export_df: Workbench export containing ``id`` and ``node_id``.
         metadata_df: Human-editable metadata sheet.
+        id_column: Metadata sheet column that holds the record identifier.
 
     Returns:
         Tuple containing:
@@ -511,9 +533,9 @@ def merge_sheets(
 
     Raises:
         KeyError: If the export is missing ``id`` or ``node_id``.
-        ValueError: If the metadata sheet is missing both ``identifier`` and
-            ``id``, either input contains blank normalized identifiers, or
-            either input contains duplicate normalized identifiers.
+        ValueError: If the metadata sheet is missing ``id_column``, either
+            input contains blank normalized identifiers, or either input
+            contains duplicate normalized identifiers.
     """
     logger = logging.getLogger(LOGGER_NAME)
 
@@ -543,22 +565,9 @@ def merge_sheets(
         ['id', 'node_id']
     ].copy()
 
-    # Identify the metadata identifier field
-    if 'identifier' in metadata_df.columns:
-        metadata_id_field = 'identifier'
-    elif 'id' in metadata_df.columns:
-        metadata_id_field = 'id'
-        logger.info(
-            "Preferred metadata join field 'identifier' was not found; "
-            "using fallback field 'id'."
-        )
-    else:
-        message = (
-            "Metadata sheet is missing the required join column "
-            "'identifier' (or fallback 'id')."
-        )
-        logger.error(message)
-        raise ValueError(message)
+    # Confirm the metadata identifier field exists
+    validate_id_column(metadata_df, id_column)
+    metadata_id_field = id_column
 
     logger.info(
         "Using '%s' as the metadata join field.",
@@ -1811,6 +1820,7 @@ def validate_record(
     record: dict,
     ingest_sheet: pd.DataFrame,
     ingest_task: str,
+    id_column: str,
 ) -> dict:
     """Validate fields and values in a metadata record.
 
@@ -1819,6 +1829,7 @@ def validate_record(
         record: Record to validate.
         ingest_sheet: Full ingest sheet.
         ingest_task: Ingest task.
+        id_column: Ingest sheet column that holds the record identifier.
 
     Returns:
         Validated record.
@@ -1902,6 +1913,7 @@ def validate_record(
                     pid,
                     parent_id,
                     'field_domain_access',
+                    id_column,
                 )
 
                 for domain in parent_domains:
@@ -1922,6 +1934,7 @@ def validate_record(
                     pid,
                     parent_id,
                     'field_depositor',
+                    id_column,
                 )
 
                 for depositor in parent_depositors:
@@ -1964,6 +1977,7 @@ def get_parent_values(
     pid: str,
     parent_id: str,
     column: str,
+    id_column: str,
 ) -> list[str]:
     """Inherit the values of a field from a parent record.
 
@@ -1973,6 +1987,7 @@ def get_parent_values(
         parent_id: PID of the parent record.
         column: Ingest sheet column to read from the parent row (e.g.
             ``field_domain_access`` or ``field_depositor``).
+        id_column: Ingest sheet column that holds the record identifier.
 
     Returns:
         Parent values for the column, if found.
@@ -1980,10 +1995,6 @@ def get_parent_values(
     parent_values = []
 
     try:
-        id_column = (
-            'identifier' if 'identifier' in ingest_sheet.columns else 'id'
-        )
-        
         # Locate parent row and extract the requested column
         match = ingest_sheet.loc[
             ingest_sheet[id_column] == parent_id,
@@ -2028,7 +2039,7 @@ def process_model(
         True if model is valid; otherwise False.
     """
     pid = record['id'][0]
-    
+
     # Source data may supply either the model's display name (e.g. "Page")
     # or its taxonomy term ID (e.g. "17") - both are valid inputs throughout
     # this pipeline (see also the similar name-or-ID check in remove_pages).
@@ -2083,6 +2094,7 @@ def process_record(
     result: ProcessingResult,
     row: pd.Series,
     index: int,
+    id_column: str,
 ) -> dict | None:
     """Transform a raw CSV row into a structured metadata record.
 
@@ -2090,6 +2102,7 @@ def process_record(
         result: Runtime processing result.
         row: Source row.
         index: Row index.
+        id_column: Column that holds the record identifier.
 
     Returns:
         Processed record, or None if processing fails.
@@ -2097,17 +2110,15 @@ def process_record(
     # Setup record
     record = initialize_record()
 
-    # Find the first key that exists in the row's index
-    valid_key = next((k for k in IDENTIFIERS if k in row.index), None)
-
-    pid = row[valid_key] if valid_key else None
+    # Read the record identifier from the designated column
+    pid = row[id_column] if id_column in row.index else None
     pid = remove_whitespaces(str(pid)) if pd.notna(pid) else None
 
     if not pid:
         msg = f"row {index} missing required identifier"
         result.log_issue(
             'UNKNOWN',
-            'identifier',
+            id_column,
             None,
             msg,
             f"{msg.capitalize()}.",
@@ -2213,17 +2224,38 @@ def process_files(
     logger = logging.getLogger(LOGGER_NAME)
 
     try:
-
+        # Confirm the identifier column exists in the metadata sheet
+        if not metadata_df.empty:
+            validate_id_column(metadata_df, config.id_column)
+            logger.info(
+                "Using '%s' as the identifier column.",
+                config.id_column,
+            )
 
         # Merge export and metadata sheets
         if not export_df.empty and not metadata_df.empty:
             ingest_sheet, unmatched_records = merge_sheets(
                 export_df,
-                metadata_df
+                metadata_df,
+                config.id_column,
             )
         else:
             ingest_sheet = metadata_df
             unmatched_records = pd.DataFrame()
+            
+        # Write unmatched rows immediately, before any validation can stop
+        # the run, so the report is always available for troubleshooting
+        unmatched_log_csv = None
+
+        if not unmatched_records.empty:
+            unmatched_log_csv = (
+                config.log_dir / f'{config.file_prefix}_unmatched.csv'
+            )
+            logger.warning(
+                "Unmatched rows found, writing to %s.",
+                unmatched_log_csv,
+            )
+            df_to_csv(unmatched_records, unmatched_log_csv)
 
         # Confirm that ingest sheet contains node_ids for update task
         if config.ingest_task == 'update':
@@ -2248,6 +2280,10 @@ def process_files(
                     f"Update ingest contains {int(blank_node_ids.sum())} "
                     "record(s) without a node_id."
                 )
+
+                if unmatched_log_csv:
+                    message += f" See unmatched report: {unmatched_log_csv}"
+
                 logger.error(message)
                 raise ValueError(message)
 
@@ -2261,16 +2297,6 @@ def process_files(
         # Remove Page objects
         elif config.remove_pages:
             ingest_sheet = remove_pages(ingest_sheet, logger)
-
-        if not unmatched_records.empty:
-            unmatched_log_csv = (
-                config.log_dir / f'{config.file_prefix}_unmatched.csv'
-            )
-            logger.warning(
-                "Unmatched rows found, writing to %s.",
-                unmatched_log_csv,
-            )
-            df_to_csv(unmatched_records, unmatched_log_csv)
 
         # Process Batch
         buffer = []
@@ -2299,7 +2325,7 @@ def process_files(
                 desc="Processing Records",
                 unit='record',
             ):
-                record = process_record(result, row, idx)
+                record = process_record(result, row, idx, config.id_column)
 
                 if record:
                     record = validate_record(
@@ -2307,6 +2333,7 @@ def process_files(
                         record,
                         ingest_sheet,
                         config.ingest_task,
+                        config.id_column,
                     )
                     record = format_record(record)
                     buffer.append(record)
