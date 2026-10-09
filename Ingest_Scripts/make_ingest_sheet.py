@@ -2222,6 +2222,7 @@ def process_files(
         True if processing completes; otherwise False.
     """
     logger = logging.getLogger(LOGGER_NAME)
+    completed = False
 
     try:
         # Confirm the identifier column exists in the metadata sheet
@@ -2360,13 +2361,7 @@ def process_files(
                 config,
             )
 
-        write_reports(
-            config.log_dir,
-            config.timestamp,
-            'metadata',
-            result.transformations,
-            result.issues
-        )
+        completed = True
 
         return True
 
@@ -2379,6 +2374,23 @@ def process_files(
         )
 
         return False
+
+    finally:
+        # Write the issue and transformation reports even if processing
+        # stopped early, so the findings collected so far aren't lost. When
+        # the run failed before anything was collected, skip the reports to
+        # avoid a misleading "no exceptions" message.
+        if completed or result.issues or result.transformations:
+            try:
+                write_reports(
+                    config.log_dir,
+                    config.timestamp,
+                    'metadata',
+                    result.transformations,
+                    result.issues
+                )
+            except Exception:
+                logger.exception("Failed to write processing reports.")
 
 
 def main() -> None:
@@ -2448,6 +2460,21 @@ def main() -> None:
 
         sys.exit(1)
 
+    # A run that stopped early is a failure regardless of how many records
+    # had already failed individually
+    if not success:
+        msg = "Processing did not complete successfully."
+
+        if critical_failures_count > 0:
+            unit = "record" if critical_failures_count == 1 else "records"
+            msg += (
+                f" {critical_failures_count} {unit} failed before the run "
+                "stopped."
+            )
+
+        logger.error("%s", msg)
+        sys.exit(1)
+
     if critical_failures_count > 0:
         unit = "record" if critical_failures_count == 1 else "records"
         msg = f"{critical_failures_count} {unit} failed to process."
@@ -2456,13 +2483,10 @@ def main() -> None:
             f"\n{WARNING_SYMBOL} {msg}",
             f" See logs: {config.log_path}" if config.log_path else ""
         )
-    elif success:
+    else:
         msg = "All records were processed successfully."
         logger.info("%s", msg)
         print(f"\n{SUCCESS_SYMBOL} {msg}")
-    elif not success:
-        logger.error("Processing did not complete successfully.")
-        sys.exit(1)
 
 
 if __name__ == '__main__':
