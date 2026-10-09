@@ -1937,6 +1937,16 @@ def validate_record(
                     id_column,
                 )
 
+                # Apply the same vocabulary prefix the mapping tables give a
+                # depositor entered directly on a record (e.g.
+                # "contributing_institution:"), so inherited values match.
+                depositor_mapping = get_mapped_field(
+                    result,
+                    pid,
+                    'field_depositor',
+                    '',
+                )
+
                 for depositor in parent_depositors:
                     add_value(
                         result,
@@ -1944,6 +1954,7 @@ def validate_record(
                         None,
                         'field_depositor',
                         depositor,
+                        depositor_mapping.prefix,
                     )
 
             # Skip since children do not get collection associations
