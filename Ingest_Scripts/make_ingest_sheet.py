@@ -1481,7 +1481,10 @@ def process_title(
     Args:
         result: Runtime processing result.
         record: Record being updated.
-        title_parts: Title components.
+        title_parts: Title components, keyed by source CSV field name.
+            Recognized keys are ``title``, ``volume``, and ``issue`` (the
+            metadata template's header). ``number`` is also accepted as an
+            alternate name for the issue.
 
     Returns:
         Formatted title, if created.
@@ -1489,11 +1492,14 @@ def process_title(
     title = title_parts.get('title')
 
     if title:
-        if title_parts.get('volume'):
-            title += f", vol. {title_parts.get('volume')}"
+        volume = title_parts.get('volume')
+        issue = title_parts.get('issue') or title_parts.get('number')
 
-        if title_parts.get('number'):
-            title += f", no. {title_parts.get('number')}"
+        if volume:
+            title += f", vol. {volume}"
+
+        if issue:
+            title += f", no. {issue}"
 
         add_title(result, record, title)
 
