@@ -18,6 +18,15 @@ Usage:
         --metadata_id <metadata_sheet_id> \
         --id-column identifier
 
+    # Read a specific tab of a Google Sheet (the first tab is the default)
+    python3 make_ingest_sheet.py \
+        --user_id abc123 \
+        --ingest_task create \
+        --batch_path /workbench/batches/example \
+        --metadata_id <metadata_sheet_id> \
+        --metadata_tab "Batch 5" \
+        --id-column identifier
+
     # Update existing objects using local spreadsheets
     python3 make_ingest_sheet.py \
         --ingest_task update \
@@ -148,6 +157,7 @@ class AppConfig:
     remove_pages: bool
     export_sheet: str | None = None
     metadata_sheet: str | None = None
+    metadata_tab: str | None = None
     refresh_taxonomies: bool = False
     batch_dir: str | None = None
     timestamp: str | None = None
@@ -414,6 +424,14 @@ def parse_arguments() -> AppConfig:
         help="Google Sheet ID for the metadata file.",
     )
     parser.add_argument(
+        '--metadata_tab',
+        type=str,
+        help=(
+            "Tab name within the metadata Google Sheet. Defaults to the "
+            "first tab. Only valid with --metadata_id."
+        ),
+    )
+    parser.add_argument(
         '--metadata_sheet',
         type=str,
         help="Path to metadata sheet on local device.",
@@ -505,6 +523,11 @@ def parse_arguments() -> AppConfig:
             "Provide either --metadata_id or --metadata_sheet, not both."
         )
 
+    if args.metadata_tab and not args.metadata_id:
+        raise ValueError(
+            "--metadata_tab can only be used with --metadata_id."
+        )
+
     args.publish = args.publish == 'y'
 
     return AppConfig(**vars(args))
@@ -542,12 +565,13 @@ def load_input_sheets(config: AppConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     if config.metadata_id:
         logger.info(
-            "Using metadata sheet from Google ID: %s",
+            "Using metadata sheet from Google ID: %s (tab: %s)",
             config.metadata_id,
+            config.metadata_tab or 'first tab',
         )
         metadata_df = read_google_sheet(
             config.metadata_id,
-            sheet_name=config.metadata_sheet,
+            sheet_name=config.metadata_tab,
             credentials_file=config.credentials_file,
         )
     elif config.metadata_sheet:
