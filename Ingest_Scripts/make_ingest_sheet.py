@@ -332,6 +332,20 @@ class FamilyOrder:
     circular: set[int] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class TaxonomyLookup:
+    """Taxonomy terms indexed by vocabulary for fast validation."""
+
+    # Vocabulary -> every term name in it
+    names: dict[str, frozenset[str]]
+
+    # Vocabulary -> every term ID in it
+    term_ids: dict[str, frozenset[str]]
+
+    # Vocabulary -> term ID -> name of the first term with that ID
+    id_to_name: dict[str, dict[str, str]]
+
+
 # ---------------------------------------------------------------------------
 # Functions
 # ---------------------------------------------------------------------------
@@ -2062,6 +2076,58 @@ def validate_edtf_date(
         return True
 
 
+def build_taxonomy_lookup(taxonomies: pd.DataFrame) -> TaxonomyLookup:
+    """Index taxonomy terms by vocabulary.
+
+    Args:
+        taxonomies: Taxonomy table with ``Vocabulary``, ``Name``, and
+            ``Term ID`` columns.
+
+    Returns:
+        TaxonomyLookup built from the table.
+    """
+    names = {}
+    term_ids = {}
+    id_to_name = {}
+
+    for vocabulary, name, term_id in zip(
+        taxonomies['Vocabulary'],
+        taxonomies['Name'],
+        taxonomies['Term ID'],
+    ):
+        names.setdefault(vocabulary, set()).add(name)
+        term_ids.setdefault(vocabulary, set()).add(term_id)
+        id_to_name.setdefault(vocabulary, {}).setdefault(term_id, name)
+
+    return TaxonomyLookup(
+        names={vocab: frozenset(values) for vocab, values in names.items()},
+        term_ids={
+            vocab: frozenset(values) for vocab, values in term_ids.items()
+        },
+        id_to_name=id_to_name,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_taxonomy_lookup() -> TaxonomyLookup:
+    """Return the taxonomy index, building it on first use.
+
+    The index is built from the loaded taxonomy table. Call
+    ``get_taxonomy_lookup.cache_clear()`` if the table is reloaded.
+    """
+    return build_taxonomy_lookup(TAXONOMIES)
+
+
+@lru_cache(maxsize=None)
+def warn_unknown_taxonomy(taxonomy: str) -> None:
+    """Log once that a taxonomy name matches no loaded vocabulary."""
+    logging.getLogger(LOGGER_NAME).warning(
+        "Taxonomy '%s' was not found among the loaded vocabularies; every "
+        "term checked against it will be reported as missing.",
+        taxonomy,
+    )
+
+
 def validate_term(
     result: ProcessingResult,
     pid: str,
@@ -2081,20 +2147,17 @@ def validate_term(
     Returns:
         True if term is valid; otherwise False.
     """
-    mask = (
-        (TAXONOMIES['Name'] == value)
-        & (TAXONOMIES['Vocabulary'] == taxonomy)
+    lookup = get_taxonomy_lookup()
+
+    if taxonomy not in lookup.names:
+        warn_unknown_taxonomy(taxonomy)
+
+    found = (
+        value in lookup.names.get(taxonomy, ())
+        or value in lookup.term_ids.get(taxonomy, ())
     )
-    matching_rows = TAXONOMIES.loc[mask]
 
-    if matching_rows.empty:
-        mask = (
-            (TAXONOMIES['Term ID'] == value)
-            & (TAXONOMIES['Vocabulary'] == taxonomy)
-        )
-        matching_rows = TAXONOMIES.loc[mask]
-
-    if matching_rows.empty:
+    if not found:
         result.log_issue(
             pid,
             field,
@@ -2351,14 +2414,13 @@ def process_model(
     model_mapping = MODEL_MAPPING.get(value)
 
     if not model_mapping:
-        mask = (
-            (TAXONOMIES['Term ID'] == value)
-            & (TAXONOMIES['Vocabulary'] == 'Islandora Models')
+        model_name = (
+            get_taxonomy_lookup()
+            .id_to_name
+            .get('Islandora Models', {})
+            .get(value)
         )
-        matching_rows = TAXONOMIES.loc[mask]
-
-        if not matching_rows.empty:
-            model_name = matching_rows.iloc[0]['Name']
+        if model_name is not None:
             model_mapping = MODEL_MAPPING.get(model_name)
 
     if model_mapping is None:
@@ -2819,6 +2881,10 @@ def main() -> None:
             refresh=config.refresh_taxonomies,
             logger=logger,
         )
+
+        # Index the loaded taxonomies for fast term validation
+        get_taxonomy_lookup.cache_clear()
+        get_taxonomy_lookup()
 
         result = ProcessingResult()
 
