@@ -50,7 +50,7 @@ import re
 import os
 import sys
 import traceback
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -276,6 +276,30 @@ class FieldMapping:
     def is_mapped(self) -> bool:
         """Return whether a mapping was found."""
         return self.field is not None
+
+
+@dataclass(frozen=True)
+class MappingResolution:
+    """Outcome of resolving a source CSV field against the mapping tables.
+
+    Resolution depends only on the CSV field name, so it is computed once per
+    field and cached for the run. Anything worth logging is stored here
+    rather than logged during the lookup; it is logged per record, and only
+    for records that actually have data in the field.
+    """
+
+    mapping: FieldMapping = field(default_factory=FieldMapping)
+
+    # Linked-agent lookup details (role-based columns such as
+    # "photographer_person")
+    agent_role_term: str | None = None
+    agent_issue: str | None = None
+    relator_code: str | None = None
+    relator_note: str | None = None
+
+    # How an unmatched field was ultimately handled: "i2_field" when the
+    # name is itself an I2 field, "unmapped" when it is dropped
+    fallback: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1151,103 +1175,86 @@ def is_repeatable_field(field: str | None) -> bool:
     return match.iat[0] == 'TRUE'
 
 
-def get_agent_data(
-    result: ProcessingResult,
-    pid: str,
-    field: str,
-) -> tuple[str, str] | bool:
-    """Resolve linked-agent taxonomy and prefix from a mapped field.
+def resolve_agent_data(csv_field: str) -> MappingResolution | None:
+    """Resolve linked-agent taxonomy and prefix from a CSV field name.
+
+    This only looks values up; any issue or transformation it finds is
+    returned in the resolution so it can be logged later, per record.
 
     Args:
-        result: Runtime processing result.
-        pid: Record PID.
-        field: CSV field name.
+        csv_field: CSV field name.
 
     Returns:
-        Tuple of taxonomy and prefix, or False if field is not agent-like.
+        Resolution with the linked-agent mapping on success, a resolution
+        describing the failure when the field looks like an agent field but
+        cannot be resolved, or None if the field is not agent-like.
     """
-    if not field or '_' not in field:
-        return False
-    
+    if not csv_field or '_' not in csv_field:
+        return None
+
     # Agent-related CSV columns follow a "{role}_{agent_type}" naming
     # convention in the metadata sheet, e.g. "photographer_person" or
     # "sponsor_corporate". Splitting on the last underscore separates the
     # relator role (which may itself contain underscores) from the agent
     # type suffix.
-    role_term, agent_type = field.rsplit('_', 1)
+    role_term, agent_type = csv_field.rsplit('_', 1)
     role_term = role_term.replace('_', ' ')
 
     relator = RELATOR_TERMS.get(role_term)
 
     if not relator:
-        result.log_issue(
-            pid,
-            field,
-            role_term,
-            "could not find relator term",
+        return MappingResolution(
+            agent_role_term=role_term,
+            agent_issue="could not find relator term",
         )
-        return False
 
     relator_code = relator['code']
-    note = relator['note']
-
-    if note:
-        result.log_transformation(
-            pid,
-            field,
-            role_term,
-            relator_code,
-            note,
-        )
-        logging.getLogger(LOGGER_NAME).warning(
-            "Record %s: Relator code %s - %s",
-            pid,
-            relator_code,
-            note,
-        )
+    relator_note = relator['note'] or None
 
     agent_type = LINKED_AGENT_TYPES.get(agent_type)
 
     if not agent_type:
-        result.log_issue(
-            pid,
-            field,
-            role_term,
-            "could not determine linked agent type",
+        return MappingResolution(
+            agent_role_term=role_term,
+            agent_issue="could not determine linked agent type",
+            relator_code=relator_code,
+            relator_note=relator_note,
         )
-        return False
 
-    taxonomy = agent_type.replace('_', ' ').title()
-    prefix = f'relators:{relator_code}:{agent_type}:'
+    return MappingResolution(
+        mapping=FieldMapping(
+            field='field_linked_agent',
+            taxonomy=agent_type.replace('_', ' ').title(),
+            prefix=f'relators:{relator_code}:{agent_type}:',
+            repeatable=is_repeatable_field('field_linked_agent'),
+        ),
+        agent_role_term=role_term,
+        relator_code=relator_code,
+        relator_note=relator_note,
+    )
 
-    return taxonomy, prefix
 
-
-def get_mapped_field(
-    result: ProcessingResult,
-    pid: str,
-    csv_field: str,
-    data: str,
-) -> FieldMapping:
-    """Return the Islandora field mapping for a source CSV field.
+@lru_cache(maxsize=None)
+def resolve_column_mapping(csv_field: str) -> MappingResolution:
+    """Resolve a source CSV field to its Islandora field mapping.
 
     Searches the template, manifest, and MARC field mapping tables for the
-    supplied CSV field. If no direct mapping is found, linked-agent fields are
-    handled separately. Any unmapped field is logged as an issue.
+    supplied CSV field. If no direct mapping is found, linked-agent fields
+    are handled separately, then fields that are themselves I2 fields.
+
+    The result depends only on the field name and the mapping tables, which
+    are fixed for the run, so it is cached. This function never logs.
 
     Args:
-        result: Runtime processing result.
-        pid: Current record PID.
         csv_field: Source CSV field.
-        data: Source cell value.
 
     Returns:
-        FieldMapping object containing the mapped Islandora field, taxonomy,
-        prefix, and repeatability. If no mapping is found, all optional
-        attributes will be None and ``repeatable`` will be False.
+        MappingResolution containing the FieldMapping and any details to
+        log. If no mapping is found, the FieldMapping has all optional
+        attributes set to None and ``repeatable`` False.
     """
     if csv_field in SCAN_BATCH_DIR_FIELDS:
-        return FieldMapping()
+        return MappingResolution()
 
     mapping_columns = [
         'machine_name',
@@ -1270,7 +1277,7 @@ def get_mapped_field(
 
         row = match.iloc[0]
 
-        field = (
+        mapped_field = (
             None
             if pd.isna(row['machine_name'])
             else row['machine_name']
@@ -1292,31 +1299,84 @@ def get_mapped_field(
             has_capitals = any(char.isupper() for char in prefix)
             prefix = f"{prefix} " if has_capitals else prefix
 
-        return FieldMapping(
-            field=field,
-            taxonomy=taxonomy,
-            prefix=prefix,
-            repeatable=is_repeatable_field(field),
-        )
-
-    if check_if_agent_field(csv_field):
-        agent_data = get_agent_data(result, pid, csv_field)
-
-        if agent_data:
-            taxonomy, prefix = agent_data
-            field = 'field_linked_agent'
-
-            return FieldMapping(
-                field=field,
+        return MappingResolution(
+            mapping=FieldMapping(
+                field=mapped_field,
                 taxonomy=taxonomy,
                 prefix=prefix,
-                repeatable=is_repeatable_field(field),
+                repeatable=is_repeatable_field(mapped_field),
             )
+        )
+
+    agent_resolution = None
+
+    if check_if_agent_field(csv_field):
+        agent_resolution = resolve_agent_data(csv_field)
+
+        if agent_resolution and agent_resolution.mapping.is_mapped:
+            return agent_resolution
+
+    # Keep any failed agent lookup details so they are still reported
+    base = agent_resolution or MappingResolution()
 
     # TODO: Support taxonomy and prefix matching by updating I2 field schema
     match = FIELDS.loc[FIELDS['Field'] == csv_field]
 
     if not match.empty:
+        return replace(
+            base,
+            mapping=FieldMapping(
+                field=csv_field,
+                taxonomy=None,
+                prefix=None,
+                repeatable=is_repeatable_field(csv_field),
+            ),
+            fallback='i2_field',
+        )
+
+    return replace(base, fallback='unmapped')
+
+
+def log_mapping_resolution(
+    result: ProcessingResult,
+    pid: str,
+    csv_field: str,
+    data: str,
+    resolution: MappingResolution,
+) -> None:
+    """Log the issues and transformations found while resolving a field.
+
+    Args:
+        result: Runtime processing result.
+        pid: Current record PID.
+        csv_field: Source CSV field.
+        data: Source cell value.
+        resolution: Cached resolution for the field.
+    """
+    if resolution.relator_note:
+        result.log_transformation(
+            pid,
+            csv_field,
+            resolution.agent_role_term,
+            resolution.relator_code,
+            resolution.relator_note,
+        )
+        logging.getLogger(LOGGER_NAME).warning(
+            "Record %s: Relator code %s - %s",
+            pid,
+            resolution.relator_code,
+            resolution.relator_note,
+        )
+
+    if resolution.agent_issue:
+        result.log_issue(
+            pid,
+            csv_field,
+            resolution.agent_role_term,
+            resolution.agent_issue,
+        )
+
+    if resolution.fallback == 'i2_field':
         result.log_issue(
             pid,
             csv_field,
@@ -1327,26 +1387,49 @@ def get_mapped_field(
                 "are correct."
             ),
         )
-
-        return FieldMapping(
-            field=csv_field,
-            taxonomy=None,
-            prefix=None,
-            repeatable=is_repeatable_field(csv_field),
+    elif resolution.fallback == 'unmapped':
+        result.log_issue(
+            pid,
+            csv_field,
+            data,
+            "could not find matching I2 field",
+            (
+                f"Could not find matching I2 field for CSV field "
+                f"'{csv_field}' with data '{data}'. Dropping column."
+            ),
         )
 
-    result.log_issue(
-        pid,
-        csv_field,
-        data,
-        "could not find matching I2 field",
-        (
-            f"Could not find matching I2 field for CSV field "
-            f"'{csv_field}' with data '{data}'. Dropping column."
-        ),
-    )
 
-    return FieldMapping()
+def get_mapped_field(
+    result: ProcessingResult,
+    pid: str,
+    csv_field: str,
+    data: str,
+) -> FieldMapping:
+    """Return the Islandora field mapping for a source CSV field.
+
+    The lookup itself is cached per field name. Issues and transformations
+    found during the lookup are logged for this record only when the cell
+    has data, so blank cells in unmapped or special columns don't add noise
+    to the reports.
+
+    Args:
+        result: Runtime processing result.
+        pid: Current record PID.
+        csv_field: Source CSV field.
+        data: Source cell value.
+
+    Returns:
+        FieldMapping object containing the mapped Islandora field, taxonomy,
+        prefix, and repeatability. If no mapping is found, all optional
+        attributes will be None and ``repeatable`` will be False.
+    """
+    resolution = resolve_column_mapping(csv_field)
+
+    if not pd.isna(data) and str(data).strip():
+        log_mapping_resolution(result, pid, csv_field, data, resolution)
+
+    return resolution.mapping
 
 
 # --- Record Building Helpers ---
