@@ -115,6 +115,9 @@ from utilities import (
 DEFAULT_BATCH_SIZE = 10000
 LOGGER_NAME = LogRegistry.MAKE_INGEST_SHEET
 
+# Object models that are always top-level; any parent_id on these is ignored
+TOP_LEVEL_MODELS = ('Paged Content', 'Compound Object', 'Newspaper')
+
 
 # ---------------------------------------------------------------------------
 # Classes
@@ -300,6 +303,33 @@ class MappingResolution:
     # How an unmatched field was ultimately handled: "i2_field" when the
     # name is itself an I2 field, "unmapped" when it is dropped
     fallback: str | None = None
+
+
+@dataclass
+class FamilyOrder:
+    """Ingest sheet rows arranged so parents precede their children.
+
+    All per-row lists and dictionaries use positions in the reordered
+    ``sheet``, not the original row order.
+    """
+
+    # Ingest sheet in processing order
+    sheet: pd.DataFrame
+
+    # True for the last row of each family; batches may only end here
+    family_end: list[bool] = field(default_factory=list)
+
+    # Cleaned record identifier for each row
+    keys: list[str] = field(default_factory=list)
+
+    # Cleaned parent identifier for each row ('' for top-level rows)
+    parents: list[str] = field(default_factory=list)
+
+    # Rows whose parent_id matches no record in the sheet
+    unresolved_parents: set[int] = field(default_factory=set)
+
+    # Rows caught in a circular parent_id reference
+    circular: set[int] = field(default_factory=set)
 
 
 # ---------------------------------------------------------------------------
@@ -768,12 +798,192 @@ def merge_sheets(
 
 # --- Batch Helpers ---
 
+def order_records_by_family(
+    ingest_sheet: pd.DataFrame,
+    id_column: str,
+) -> FamilyOrder:
+    """Arrange ingest sheet rows so every parent precedes its children.
+
+    Workbench can only resolve a ``parent_id`` that refers to an ``id``
+    earlier in the same CSV, so each top-level record is followed directly
+    by all of its descendants. Siblings are ordered by ``field_weight``
+    when any of them has one, with unweighted siblings after the weighted
+    ones in sheet order. When none of the siblings has a ``field_weight``,
+    they are ordered by ``node_id`` instead, then by sheet order.
+
+    A record whose ``parent_id`` matches nothing in the sheet (for example,
+    a child of an object that already exists in Drupal) is treated as the
+    start of its own family and flagged in the result. Records caught in a
+    circular reference are flagged and placed last, in sheet order.
+
+    Sheets without a ``parent_id`` column are returned unchanged.
+
+    Args:
+        ingest_sheet: Ingest sheet in original row order.
+        id_column: Column that holds the record identifier.
+
+    Returns:
+        FamilyOrder with the reordered sheet and per-row family details.
+    """
+    row_count = len(ingest_sheet)
+
+    if row_count == 0 or 'parent_id' not in ingest_sheet.columns:
+        return FamilyOrder(
+            sheet=ingest_sheet,
+            family_end=[True] * row_count,
+            keys=[''] * row_count,
+            parents=[''] * row_count,
+        )
+
+    def cleaned_column(column: str) -> list[str]:
+        if column not in ingest_sheet.columns:
+            return [''] * row_count
+
+        return [
+            '' if pd.isna(value) else remove_whitespaces(str(value))
+            for value in ingest_sheet[column]
+        ]
+
+    def numeric_column(column: str) -> list[float]:
+        if column not in ingest_sheet.columns:
+            return [float('nan')] * row_count
+
+        return pd.to_numeric(
+            ingest_sheet[column],
+            errors='coerce',
+        ).tolist()
+
+    keys = cleaned_column(id_column)
+    models = cleaned_column('field_model')
+    weights = numeric_column('field_weight')
+    node_ids = numeric_column('node_id')
+
+    # parent_id is repeatable in the schema, but a record has one parent
+    parents = []
+
+    for value in cleaned_column('parent_id'):
+        tokens = split_and_clean(value)
+        parents.append(tokens[0] if tokens else '')
+
+    # Top-level models never have a parent, whatever the sheet says
+    parents = [
+        '' if models[i] in TOP_LEVEL_MODELS else parent
+        for i, parent in enumerate(parents)
+    ]
+
+    first_position = {}
+
+    for position, key in enumerate(keys):
+        if key and key not in first_position:
+            first_position[key] = position
+
+    children = {}
+
+    for position, parent in enumerate(parents):
+        if parent:
+            children.setdefault(parent, []).append(position)
+
+    def order_siblings(positions: list[int]) -> list[int]:
+        """Order a group of siblings by weight, or else by node ID."""
+        sort_values = (
+            weights
+            if any(not pd.isna(weights[p]) for p in positions)
+            else node_ids
+        )
+
+        return sorted(
+            positions,
+            key=lambda p: (
+                pd.isna(sort_values[p]),
+                0 if pd.isna(sort_values[p]) else sort_values[p],
+                p,
+            ),
+        )
+
+    visited = set()
+
+    def collect_family(start: int) -> list[int]:
+        """Return a record followed by all of its descendants."""
+        family = []
+        stack = [start]
+
+        while stack:
+            position = stack.pop()
+
+            if position in visited:
+                continue
+
+            visited.add(position)
+            family.append(position)
+
+            if keys[position]:
+                siblings = order_siblings(children.get(keys[position], []))
+                stack.extend(reversed(siblings))
+
+        return family
+
+    families = []
+    unresolved = set()
+    emitted_orphan_groups = set()
+
+    for position in range(row_count):
+        parent = parents[position]
+
+        if not parent:
+            if position not in visited:
+                families.append(collect_family(position))
+
+        elif parent not in first_position:
+            # Parent is not in this sheet. Records that share a missing
+            # parent are siblings, so order them together, at the point
+            # where the first of them appears.
+            if parent in emitted_orphan_groups:
+                continue
+
+            emitted_orphan_groups.add(parent)
+
+            for member in order_siblings(children[parent]):
+                unresolved.add(member)
+
+                if member not in visited:
+                    families.append(collect_family(member))
+
+    # Anything left is part of, or hangs from, a circular reference
+    circular = {
+        position for position in range(row_count) if position not in visited
+    }
+
+    for position in sorted(circular):
+        families.append([position])
+
+    order = [position for family in families for position in family]
+    family_end = []
+
+    for family in families:
+        family_end.extend([False] * (len(family) - 1) + [True])
+
+    new_position = {original: new for new, original in enumerate(order)}
+
+    return FamilyOrder(
+        sheet=ingest_sheet.iloc[order],
+        family_end=family_end,
+        keys=[keys[original] for original in order],
+        parents=[parents[original] for original in order],
+        unresolved_parents={new_position[p] for p in unresolved},
+        circular={new_position[p] for p in circular},
+    )
+
+
 def should_flush_batch(buffer: list, batch_size: int) -> bool:
-    """Determine whether the current batch should be flushed to disk.
+    """Determine whether the current batch is large enough to flush.
+
+    This is a minimum, not a hard limit. Callers only flush at the end of
+    a family of records, so a batch can exceed ``batch_size`` rather than
+    split a parent from its children.
 
     Args:
         buffer: Processed record buffer.
-        batch_size: Maximum number of records in a batch.
+        batch_size: Number of records at which a batch may be flushed.
 
     Returns:
         True if batch should be flushed; otherwise False.
@@ -797,7 +1007,8 @@ def flush_batch(
         DataFrame written from the record buffer.
     """
     sub_batch_prefix = (
-        f'{config.batch_dir}_{batch_count}_ingest_{config.metadata_level}'
+        f'{config.file_prefix}_{batch_count}_'
+        f'{config.ingest_task}_{config.metadata_level}'
     )
     sub_batch_file = f'{sub_batch_prefix}.csv'
     sub_batch_path = config.output_dir / sub_batch_file
@@ -856,25 +1067,17 @@ def save_records(
     # Filter fields to those allowable by ingest task
     records_df = filter_fields(records_df, config.ingest_task)
 
-    # Sort records so that parent objects are first
+    # Ensure that parent_id is empty for top-level object models. Records
+    # arrive already ordered with parents before children (see
+    # order_records_by_family), so they are not re-sorted here.
     if (
         'parent_id' in records_df.columns
         and 'field_model' in records_df.columns
     ):
-        # Ensure that parent_id is empty for top-level object models
-        parent_models = ['Paged Content', 'Compound Object', 'Newspaper']
-
         records_df.loc[
-            records_df['field_model'].isin(parent_models),
+            records_df['field_model'].isin(TOP_LEVEL_MODELS),
             'parent_id',
         ] = pd.NA
-
-        records_df.sort_values(
-            by='parent_id',
-            ascending=True,
-            na_position='first',
-            inplace=True,
-        )
 
     # Write the resulting DataFrame to a CSV file
     df_to_csv(records_df, destination)
@@ -2304,6 +2507,61 @@ def process_record(
     return record
 
 
+def log_family_issues(
+    result: ProcessingResult,
+    pid: str,
+    position: int,
+    family_order: FamilyOrder,
+    failed_keys: set[str],
+) -> None:
+    """Report parent/child problems found while ordering records.
+
+    The record is still written in every case; these are issues to review.
+
+    Args:
+        result: Runtime processing result.
+        pid: PID of the record being processed.
+        position: Position of the record in the reordered sheet.
+        family_order: Result of ordering the records by family.
+        failed_keys: Identifiers of records that failed to process.
+    """
+    parent = family_order.parents[position]
+
+    if position in family_order.circular:
+        result.log_issue(
+            pid,
+            'parent_id',
+            parent,
+            "circular parent_id reference",
+            (
+                f"parent_id '{parent}' leads back to this record. The record "
+                "was written, but it cannot be ordered after its parent."
+            ),
+        )
+    elif position in family_order.unresolved_parents:
+        result.log_issue(
+            pid,
+            'parent_id',
+            parent,
+            "parent not found in the ingest sheet",
+            (
+                f"Parent '{parent}' was not found in the ingest sheet. The "
+                "record was written anyway."
+            ),
+        )
+    elif parent and parent in failed_keys:
+        result.log_issue(
+            pid,
+            'parent_id',
+            parent,
+            "parent record failed to process",
+            (
+                f"Parent '{parent}' failed to process and is not in the "
+                "ingest file. The record was written anyway."
+            ),
+        )
+
+
 def process_files(
     export_df: pd.DataFrame,
     metadata_df: pd.DataFrame,
@@ -2420,15 +2678,32 @@ def process_files(
                     buffer.clear()
 
         else:
-            for idx, row in tqdm(
-                ingest_sheet.iterrows(),
-                total=len(ingest_sheet),
-                desc="Processing Records",
-                unit='record',
+            # Order rows so parents precede children and families stay whole
+            family_order = order_records_by_family(
+                ingest_sheet,
+                config.id_column,
+            )
+            ingest_sheet = family_order.sheet
+            failed_keys = set()
+
+            for position, (idx, row) in enumerate(
+                tqdm(
+                    ingest_sheet.iterrows(),
+                    total=len(ingest_sheet),
+                    desc="Processing Records",
+                    unit='record',
+                )
             ):
                 record = process_record(result, row, idx, config.id_column)
 
                 if record:
+                    log_family_issues(
+                        result,
+                        record['id'][0],
+                        position,
+                        family_order,
+                        failed_keys,
+                    )
                     record = validate_record(
                         result,
                         record,
@@ -2440,10 +2715,27 @@ def process_files(
                     buffer.append(record)
                 else:
                     result.increment_failure_count()
-                    continue
 
-                # Complete batch if max size reached
-                if should_flush_batch(buffer, config.batch_size):
+                    if family_order.keys[position]:
+                        failed_keys.add(family_order.keys[position])
+
+                # Complete batch once the size is reached, but only at the
+                # end of a family so parents and children are never split
+                if (
+                    buffer
+                    and family_order.family_end[position]
+                    and should_flush_batch(buffer, config.batch_size)
+                ):
+                    if len(buffer) > config.batch_size:
+                        logger.info(
+                            "Batch %d has %d records, more than the batch "
+                            "size of %d, to keep parent and child records "
+                            "together.",
+                            result.current_batch,
+                            len(buffer),
+                            config.batch_size,
+                        )
+
                     flush_batch(
                         buffer,
                         result.current_batch,
