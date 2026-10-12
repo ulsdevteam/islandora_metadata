@@ -58,6 +58,7 @@ import logging
 import re
 import os
 import sys
+import time
 import traceback
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
@@ -1895,38 +1896,127 @@ def process_title(
 
 # --- Validation Helpers ---
 
-@lru_cache(maxsize=500)
-def _check_network_status(value: str) -> tuple[bool, str]:
-    """Perform cached HTTP validation for a collection node ID.
+class CollectionNodeChecker:
+    """Check that collection nodes exist, remembering only definite answers.
 
-    Args:
-        value: Node ID to check.
-
-    Returns:
-        Tuple containing validation status and error description.
+    A node that exists, or definitely doesn't, is remembered for the rest of
+    the run. A network problem (a timeout, a server error, too many requests)
+    says nothing about the node, so it is never remembered. A failed request
+    is retried a couple of times first, since most problems are brief. If it
+    keeps failing, checking pauses for a cooldown period, so an outage doesn't
+    make every record wait for a timeout and isn't blamed on the collection.
     """
-    url = f'https://digital.library.pitt.edu/node/{value}'
 
-    try:
-        response = requests.head(url, allow_redirects=True, timeout=10)
+    BASE_URL = 'https://digital.library.pitt.edu/node/'
+    VALID = 'valid'
+    INVALID = 'invalid'
+    UNVERIFIED = 'unverified'
 
-        if response.status_code == 404: # Page Not Found - node doesn't exist
-            return False, f"URL returned 404: {url}"
+    def __init__(
+        self,
+        timeout: int = 10,
+        retries: int = 2,
+        backoff: float = 1.0,
+        cooldown: float = 60.0,
+    ) -> None:
+        self.timeout = timeout
+        self.retries = retries
+        self.backoff = backoff
+        self.cooldown = cooldown
+        self._answers: dict[str, tuple[str, str]] = {}
+        self._paused_until = 0.0
 
-        if response.status_code in {
-            200, # OK - published
-            301, # Moved Permanently - redirect to published collection page
-            403, # Forbidden - unpublised collection page
-        }:
-            return True, ''
+    def check(self, value: str) -> tuple[str, str]:
+        """Check a collection node ID.
 
-        return False, f"Unexpected status code {response.status_code}: {url}"
+        Args:
+            value: Node ID to check.
 
-    except requests.exceptions.RequestException as error:
-        msg = "HTTP request failed"
-        logging.getLogger(LOGGER_NAME).exception(msg)
+        Returns:
+            Tuple of status (VALID, INVALID, or UNVERIFIED) and a message
+            describing any problem.
+        """
+        if value in self._answers:
+            return self._answers[value]
 
-        return False, f"{msg}: {str(error)}"
+        if time.monotonic() < self._paused_until:
+            return (
+                self.UNVERIFIED,
+                "network checks are paused after a recent failure",
+            )
+
+        url = f'{self.BASE_URL}{value}'
+        problem = ''
+
+        for attempt in range(self.retries + 1):
+            if attempt:
+                time.sleep(self.backoff * attempt)
+
+            try:
+                response = requests.head(
+                    url,
+                    allow_redirects=True,
+                    timeout=self.timeout,
+                )
+            except requests.exceptions.RequestException as error:
+                problem = f"HTTP request failed: {error}"
+                continue
+
+            status_code = response.status_code
+
+            # The server is busy or failing, so this says nothing about the
+            # node. Try again.
+            if status_code == 429 or status_code >= 500:
+                problem = f"server returned {status_code}: {url}"
+                continue
+
+            if status_code in {
+                200, # OK - published
+                301, # Moved Permanently - redirect to published collection
+                403, # Forbidden - unpublished collection page
+            }:
+                return self._remember(value, self.VALID, '')
+
+            if status_code == 404: # Page Not Found - node doesn't exist
+                return self._remember(
+                    value,
+                    self.INVALID,
+                    f"URL returned 404: {url}",
+                )
+
+            return self._remember(
+                value,
+                self.INVALID,
+                f"Unexpected status code {status_code}: {url}",
+            )
+
+        return self._pause(problem)
+
+    def _remember(
+        self,
+        value: str,
+        status: str,
+        message: str,
+    ) -> tuple[str, str]:
+        """Store a definite answer for a node ID."""
+        self._answers[value] = (status, message)
+
+        return status, message
+
+    def _pause(self, message: str) -> tuple[str, str]:
+        """Pause network checks after a failure, without remembering it."""
+        self._paused_until = time.monotonic() + self.cooldown
+        logging.getLogger(LOGGER_NAME).warning(
+            "Collection node check failed (%s). Pausing checks for %d "
+            "seconds; affected records are reported as unverified.",
+            message,
+            self.cooldown,
+        )
+
+        return self.UNVERIFIED, message
+
+
+COLLECTION_CHECKER = CollectionNodeChecker()
 
 
 def validate_collection_id(
@@ -1944,18 +2034,24 @@ def validate_collection_id(
     Returns:
         True if the collection node ID resolves; otherwise False.
     """
-    is_valid, error_msg = _check_network_status(value)
+    status, message = COLLECTION_CHECKER.check(value)
 
-    # Call the cached network function
-    if not is_valid:
-        result.log_issue(
-            pid,
-            'field_member_of',
-            value,
-            f"invalid collection node ID: {error_msg}",
-        )
+    if status == CollectionNodeChecker.VALID:
+        return True
 
-    return is_valid
+    if status == CollectionNodeChecker.UNVERIFIED:
+        issue = f"could not verify collection node ID: {message}"
+    else:
+        issue = f"invalid collection node ID: {message}"
+
+    result.log_issue(
+        pid,
+        'field_member_of',
+        value,
+        issue,
+    )
+
+    return False
 
 
 def validate_domain(
