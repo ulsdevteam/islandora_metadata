@@ -118,6 +118,15 @@ LOGGER_NAME = LogRegistry.MAKE_INGEST_SHEET
 # Object models that are always top-level; any parent_id on these is ignored
 TOP_LEVEL_MODELS = ('Paged Content', 'Compound Object', 'Newspaper')
 
+# Columns holding files for Workbench's additional_files setting. Each one
+# needs a matching commented entry in default_create_config.yml, such as
+# "# - transcript: 9", where the number is the Media Use term ID.
+ADDITIONAL_FILE_COLUMNS = ('transcript', 'thumbnail', 'hocr', 'extracted_text')
+
+# Columns whose values are file paths or URLs for Workbench to fetch. They
+# are not Drupal field values, so the 255-character text limit doesn't apply.
+FILE_REFERENCE_COLUMNS = ('file',) + ADDITIONAL_FILE_COLUMNS
+
 
 # ---------------------------------------------------------------------------
 # Classes
@@ -1033,10 +1042,10 @@ def flush_batch(
         return pd.DataFrame()
 
     # Check for additional media files
-    media_files = []
-
-    if 'transcript' in records_df.columns:
-        media_files.append('transcript')
+    media_files = [
+        column for column in ADDITIONAL_FILE_COLUMNS
+        if column in records_df.columns
+    ]
 
     # Prepare config file
     prepare_config(
@@ -1181,15 +1190,30 @@ def prepare_config(
     content = content.replace('[USER_ID]', user_id)
     content = content.replace('[INGEST_TASK]', ingest_task)
 
-    # Uncomment additional media file types in batch
-    if media_files:
-        content = content.replace('#additional_files', 'additional_files')
+    # Uncomment the additional media file types used in this batch
+    enabled_media_files = []
 
-    for field, comment in {
-        'transcript': '# - transcript'  # Can extend list as needed
-    }.items():
-        if field in media_files:
-            content = content.replace(comment, comment[2:])
+    for column in ADDITIONAL_FILE_COLUMNS:
+        if column not in media_files:
+            continue
+
+        comment = f'# - {column}'
+
+        if comment not in content:
+            logging.getLogger(LOGGER_NAME).warning(
+                "%s has no '%s' entry, so the '%s' column will not be "
+                "configured as an additional file.",
+                default_config,
+                comment,
+                column,
+            )
+            continue
+
+        content = content.replace(comment, comment[2:])
+        enabled_media_files.append(column)
+
+    if enabled_media_files:
+        content = content.replace('#additional_files', 'additional_files')
 
     # Write the customized config to the destination
     with config_dest.open('w', encoding='utf-8') as f:
@@ -2206,7 +2230,10 @@ def validate_record(
 
         field_manager = match.iloc[0]
 
-        if field_manager.Field_Type == 'Text (plain)':
+        if (
+            field_manager.Field_Type == 'Text (plain)'
+            and field not in FILE_REFERENCE_COLUMNS
+        ):
             for value in values:
                 if len(value) > 255:
                     result.log_issue(
