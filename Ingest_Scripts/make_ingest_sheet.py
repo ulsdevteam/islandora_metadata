@@ -60,7 +60,6 @@ from typing import Optional
 import pandas as pd
 import requests
 from edtf import parse_edtf
-from dotenv import load_dotenv
 from tqdm import tqdm
 
 # Local imports
@@ -824,6 +823,7 @@ def merge_sheets(
 def order_records_by_family(
     ingest_sheet: pd.DataFrame,
     id_column: str,
+    use_hierarchy: bool = True,
 ) -> FamilyOrder:
     """Arrange ingest sheet rows so every parent precedes its children.
 
@@ -839,18 +839,25 @@ def order_records_by_family(
     start of its own family and flagged in the result. Records caught in a
     circular reference are flagged and placed last, in sheet order.
 
-    Sheets without a ``parent_id`` column are returned unchanged.
+    Sheets without a ``parent_id`` column are returned unchanged, as are
+    all sheets when ``use_hierarchy`` is False.
 
     Args:
         ingest_sheet: Ingest sheet in original row order.
         id_column: Column that holds the record identifier.
+        use_hierarchy: Whether parent_id should be used. When False, rows
+            keep their original order and are treated as unrelated.
 
     Returns:
         FamilyOrder with the reordered sheet and per-row family details.
     """
     row_count = len(ingest_sheet)
 
-    if row_count == 0 or 'parent_id' not in ingest_sheet.columns:
+    if (
+        row_count == 0
+        or not use_hierarchy
+        or 'parent_id' not in ingest_sheet.columns
+    ):
         return FamilyOrder(
             sheet=ingest_sheet,
             family_end=[True] * row_count,
@@ -1161,12 +1168,14 @@ def prepare_config(
         Path to the customized config file, or None if the default config is
         missing.
     """
-    # Load environment variable right where it's needed
-    load_dotenv()
+    logger = logging.getLogger(LOGGER_NAME)
+
+    # The project's .env file is loaded when definitions.py is imported
     import_password = os.getenv('ISLANDORA_PASSWORD', '')
 
-    # Define source and destination config paths
-    default_config = 'default_create_config.yml'
+    # Define source and destination config paths. Each ingest task has its
+    # own template, e.g. default_create_config.yml or default_update_config.yml
+    default_config = f'default_{ingest_task}_config.yml'
     config_src = UTILITY_FILES_DIR / default_config
     config_filename = f'{batch_prefix}.yml'
     config_dest = batch_path / 'configs' / config_filename
@@ -1176,11 +1185,23 @@ def prepare_config(
 
     # Read and update placeholders from default config
     if not config_src.exists():
-        print('default_create_config.yml not found in Utility_Files.')
+        message = (
+            f"{default_config} not found in Utility_Files; no config file "
+            "was written for this batch."
+        )
+        logger.error(message)
+        print(message)
         return None
 
     with config_src.open('r', encoding='utf-8') as f:
         content = f.read()
+
+    if '[ISLANDORA_PASSWORD]' in content and not import_password:
+        logger.warning(
+            "ISLANDORA_PASSWORD is not set, so the password in %s will be "
+            "blank.",
+            config_dest.name,
+        )
 
     # Replace placeholders
     content = content.replace('[ISLANDORA_PASSWORD]', import_password)
@@ -1200,7 +1221,7 @@ def prepare_config(
         comment = f'# - {column}'
 
         if comment not in content:
-            logging.getLogger(LOGGER_NAME).warning(
+            logger.warning(
                 "%s has no '%s' entry, so the '%s' column will not be "
                 "configured as an additional file.",
                 default_config,
@@ -1311,7 +1332,25 @@ def filter_fields(
             "Expected 'create' or 'update'."
         )
 
-    disallowed_fields = DISALLOWED_FIELDS_BY_INGEST_TASK[ingest_task]
+    disallowed_fields = set(DISALLOWED_FIELDS_BY_INGEST_TASK[ingest_task])
+
+    # Update tasks change node fields only. Files are added or replaced with
+    # other Workbench tasks (e.g., add_media and update_media), and Workbench
+    # rejects CSV columns that aren't Drupal fields, so file columns never
+    # belong in an update CSV.
+    if ingest_task == 'update':
+        dropped_files = [
+            column for column in FILE_REFERENCE_COLUMNS
+            if column in records.columns
+        ]
+
+        if dropped_files:
+            logging.getLogger(LOGGER_NAME).info(
+                "Removed file column(s) from the update ingest sheet: %s.",
+                ', '.join(dropped_files),
+            )
+
+        disallowed_fields |= set(FILE_REFERENCE_COLUMNS)
 
     fields_to_drop = [
         field for field in disallowed_fields
@@ -2771,6 +2810,7 @@ def process_files(
             family_order = order_records_by_family(
                 ingest_sheet,
                 config.id_column,
+                use_hierarchy=True,
             )
             ingest_sheet = family_order.sheet
             failed_keys = set()
