@@ -3,7 +3,7 @@
 """Explain "could not find term" rows in a metadata exceptions report.
 
 make_ingest_sheet.py checks every controlled value against the local taxonomy
-cache (Utility_Files/taxonomies.csv). When a value isn't found it logs
+cache. When a value isn't found it logs
 "could not find term in <vocabulary> taxonomy" but doesn't say why. This
 script reads that report and the cache, then sorts each missing term into the
 most likely cause so you know what to fix.
@@ -25,9 +25,15 @@ Usage:
         logs/2026-10-13-143439_metadata_exceptions.csv
 
     python3 check_taxonomy_misses.py <exceptions.csv> \\
-        --cache Utility_Files/taxonomies.csv \\
-        --cache-metadata Utility_Files/taxonomies_cache_metadata.json \\
+        --cache /path/to/taxonomies.csv \\
+        --cache-metadata /path/to/taxonomies_cache_metadata.json \\
         --output misses.csv
+
+By default the script reads the same cache as the other scripts: the location
+set by TAXONOMY_CACHE_DIR in the project's .env file, or Utility_Files when
+that is not set. It must sit in the same folder as definitions.py to find
+those settings. Pass --cache and --cache-metadata to read a different cache
+from anywhere.
 """
 
 # ---------------------------------------------------------------------------
@@ -49,12 +55,6 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CACHE = SCRIPT_DIR / 'Utility_Files' / 'taxonomies.csv'
-DEFAULT_CACHE_METADATA = (
-    SCRIPT_DIR / 'Utility_Files' / 'taxonomies_cache_metadata.json'
-)
 
 MISS_PATTERN = re.compile(
     r'^could not find term in (?P<vocabulary>.+) taxonomy$'
@@ -114,14 +114,18 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '--cache',
         type=Path,
-        default=DEFAULT_CACHE,
-        help="Taxonomy cache CSV (default: Utility_Files/taxonomies.csv).",
+        help=(
+            "Taxonomy cache CSV (default: the project's shared cache, "
+            "set by TAXONOMY_CACHE_DIR)."
+        ),
     )
     parser.add_argument(
         '--cache-metadata',
         type=Path,
-        default=DEFAULT_CACHE_METADATA,
-        help="Cache metadata JSON, used to report how old the cache is.",
+        help=(
+            "Cache metadata JSON, used to report how old the cache is "
+            "(default: the project's shared cache metadata)."
+        ),
     )
     parser.add_argument(
         '--output',
@@ -133,6 +137,30 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     return parser.parse_args()
+
+
+def get_default_cache_paths() -> tuple[Path, Path]:
+    """Return the taxonomy cache locations used by the other scripts.
+
+    The project settings are loaded only when a default is needed, so the
+    script can read any cache from anywhere when both paths are given.
+
+    Returns:
+        Tuple of the cache CSV path and the cache metadata JSON path.
+    """
+    try:
+        from definitions import (
+            TAXONOMY_CACHE_METADATA_PATH,
+            TAXONOMY_CACHE_PATH,
+        )
+    except Exception as error:
+        sys.exit(
+            "Could not load the project settings from definitions.py "
+            f"({error}). Run this script from the folder that contains "
+            "definitions.py, or pass --cache and --cache-metadata."
+        )
+
+    return TAXONOMY_CACHE_PATH, TAXONOMY_CACHE_METADATA_PATH
 
 
 def normalize(text: str) -> str:
@@ -241,6 +269,13 @@ def classify(vocabulary: str, term: str, indexes: dict) -> tuple[str, str]:
 def main() -> None:
     """Report why terms were not found."""
     args = parse_arguments()
+
+    if args.cache is None or args.cache_metadata is None:
+        default_cache, default_metadata = get_default_cache_paths()
+        args.cache = args.cache or default_cache
+        args.cache_metadata = args.cache_metadata or default_metadata
+
+    print(f"Taxonomy cache: {args.cache}")
 
     for path in (args.exceptions_csv, args.cache):
         if not path.exists():
