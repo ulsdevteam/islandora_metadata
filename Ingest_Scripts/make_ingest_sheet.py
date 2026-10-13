@@ -91,12 +91,14 @@ from definitions import (
     PUBLISH_FIELDS,
     RELATOR_TERMS,
     SCAN_BATCH_DIR_FIELDS,
+    TAXONOMY_CACHE_MAX_AGE_DAYS,    
     TEMPLATE_FIELD_MAPPING,
     UTILITY_FILES_DIR
 )
 from process_mods import check_if_agent_field
 from taxonomy_manager import (
     TAXONOMIES,
+    get_taxonomy_cache_age,
     load_taxonomies,
 )
 from utilities import (
@@ -3034,6 +3036,40 @@ def process_files(
                 logger.exception("Failed to write processing reports.")
 
 
+def check_taxonomy_cache_age(logger: logging.Logger) -> None:
+    """Report how old the taxonomy cache is, and warn when it is stale.
+
+    Terms added in Drupal after the last refresh are reported as missing, so
+    an old cache produces misleading results.
+
+    Args:
+        logger: Run logger.
+    """
+    age = get_taxonomy_cache_age()
+
+    if age is None:
+        message = (
+            "Could not determine when the taxonomy cache was last "
+            "refreshed."
+        )
+        logger.warning("%s", message)
+        print(f"\n{WARNING_SYMBOL} {message}")
+
+        return
+
+    message = f"The taxonomy cache was last refreshed {age.days} day(s) ago."
+
+    if age.days > TAXONOMY_CACHE_MAX_AGE_DAYS:
+        message += (
+            " Terms added in Drupal since then will be reported as missing. "
+            "Refresh it with refresh_taxonomies.py or --refresh_taxonomies."
+        )
+        logger.warning("%s", message)
+        print(f"\n{WARNING_SYMBOL} {message}")
+    else:
+        logger.info("%s", message)
+        
+
 def main() -> None:
     """Run the metadata ingest generation workflow."""
     logger = None
@@ -3068,6 +3104,9 @@ def main() -> None:
             refresh=config.refresh_taxonomies,
             logger=logger,
         )
+
+        # Warn if the shared taxonomy cache is out of date
+        check_taxonomy_cache_age(logger)
 
         # Index the loaded taxonomies for fast term validation
         get_taxonomy_lookup.cache_clear()
