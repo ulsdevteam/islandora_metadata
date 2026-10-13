@@ -102,11 +102,14 @@ class TaxonomyManager:
     Basic Auth credentials may be passed directly with ``username`` and
     ``password`` or supplied through the ``ISLANDORA_USERNAME`` and
     ``ISLANDORA_PASSWORD`` environment variables.
+
+    The taxonomy API URL (``TAXONOMY_API_URL``) is only needed to refresh the
+    cache. Loading from an existing cache works without it.
     """
 
     cache_path: str | Path
     metadata_path: str | Path
-    base_url: str = DEFAULT_TAXONOMY_URL
+    base_url: str | None = DEFAULT_TAXONOMY_URL
     page_size: int = DEFAULT_PAGE_SIZE
     delay: float = DEFAULT_FETCH_DELAY
     timeout: int = DEFAULT_TIMEOUT
@@ -147,12 +150,6 @@ class TaxonomyManager:
             if credentials_file
             else None
         )
-
-        if not self.base_url:
-            raise ValueError(
-                "Taxonomy API URL is missing. Set TAXONOMY_API_URL "
-                "in the project .env file."
-            )
 
         if self.sheet_gids is None:
             self.sheet_gids = TAXONOMY_SHEET_GIDS.copy()
@@ -296,6 +293,27 @@ class TaxonomyManager:
 
         return taxonomy_df
 
+    def _require_base_url(self) -> str:
+        """Return the taxonomy API URL, or raise if it isn't configured.
+
+        The URL is only needed when fetching from the REST export, so it is
+        checked here rather than when the manager is created. That lets runs
+        that only read the local cache work without it.
+
+        Returns:
+            The configured taxonomy API URL.
+
+        Raises:
+            ValueError: If no taxonomy API URL is configured.
+        """
+        if not self.base_url:
+            raise ValueError(
+                "Taxonomy API URL is missing. Set TAXONOMY_API_URL "
+                "in the project .env file."
+            )
+
+        return self.base_url
+
     def fetch_all_records(
         self,
     ) -> tuple[list[dict[str, Any]], int]:
@@ -304,6 +322,8 @@ class TaxonomyManager:
         Returns:
             Tuple containing all records and the number of pages fetched.
         """
+        self._require_base_url()
+
         self._log(
             logging.INFO,
             "Connecting to the taxonomy REST export.",
@@ -375,7 +395,7 @@ class TaxonomyManager:
             Taxonomy records for the requested page.
         """
         response = session.get(
-            self.base_url,
+            self._require_base_url(),
             params={'page': page},
             timeout=self.timeout,
         )
