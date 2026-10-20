@@ -25,8 +25,11 @@ import traceback
 from datetime import datetime
 
 # Local imports
-from definitions import PROJECT_ROOT
-from taxonomy_manager import TAXONOMY_MANAGER
+from definitions import TAXONOMY_LOG_DIR
+from taxonomy_manager import (
+    RefreshInProgressError,
+    TAXONOMY_MANAGER,
+)
 from utilities import (
     ERROR_SYMBOL,
     create_directory,
@@ -79,7 +82,7 @@ def main() -> None:
         args = parse_arguments()
 
         log_dir = create_directory(
-            PROJECT_ROOT / 'logs'
+            TAXONOMY_LOG_DIR
         )
         timestamp = datetime.now().strftime('%Y-%m-%d-%H%M%S')
         log_path = log_dir / f'{timestamp}_refresh_taxonomies.log'
@@ -92,6 +95,14 @@ def main() -> None:
         )
 
         print(f"Log saved to: {log_path}")
+
+    except RefreshInProgressError as error:
+        # Not a failure of the refresh itself, so skip the traceback
+        if logger:
+            logger.warning("%s", error)
+
+        print(f"\n{ERROR_SYMBOL} {error}")
+        sys.exit(1)
 
     except Exception:
         message = "Taxonomy refresh failed."

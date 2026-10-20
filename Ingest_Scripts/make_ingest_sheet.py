@@ -15,14 +15,25 @@ Usage:
         --user_id abc123 \
         --ingest_task create \
         --batch_path /workbench/batches/example \
-        --metadata_id <metadata_sheet_id>
+        --metadata_id <metadata_sheet_id> \
+        --id-column identifier
+
+    # Read a specific tab of a Google Sheet (the first tab is the default)
+    python3 make_ingest_sheet.py \
+        --user_id abc123 \
+        --ingest_task create \
+        --batch_path /workbench/batches/example \
+        --metadata_id <metadata_sheet_id> \
+        --metadata_tab "Batch 5" \
+        --id-column identifier
 
     # Update existing objects using local spreadsheets
     python3 make_ingest_sheet.py \
         --ingest_task update \
         --batch_path /workbench/batches/example \
         --export_sheet /workbench/batches/example/export/example.csv \
-        --metadata_sheet /workbench/batches/example/metadata.csv
+        --metadata_sheet /workbench/batches/example/metadata.csv \
+        --id-column identifier
 
     # Publish existing objects
     python3 make_ingest_sheet.py \
@@ -30,7 +41,8 @@ Usage:
         --metadata_level publish \
         --publish y \
         --batch_path /workbench/batches/example \
-        --metadata_id <metadata_sheet_id>
+        --metadata_id <metadata_sheet_id> \
+        --id-column identifier
 
     # Run interactively
     python3 make_ingest_sheet.py
@@ -46,8 +58,9 @@ import logging
 import re
 import os
 import sys
+import time
 import traceback
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -57,7 +70,6 @@ from typing import Optional
 import pandas as pd
 import requests
 from edtf import parse_edtf
-from dotenv import load_dotenv
 from tqdm import tqdm
 
 # Local imports
@@ -70,23 +82,23 @@ from definitions import (
     FIELDS,
     FORMATTED_FIELDS,
     GOOGLE_CREDENTIALS_FILE,
-    IDENTIFIERS,
     LINKED_AGENT_TYPES,
     MANDATORY_FIELDS,
     MANIFEST_FIELD_MAPPING,
     MARC_FIELD_MAPPING,
     MINIMAL_METADATA_FIELDS,
     MODEL_MAPPING,
-    METADATA_REQUIRED_FIELDS,
     PUBLISH_FIELDS,
     RELATOR_TERMS,
     SCAN_BATCH_DIR_FIELDS,
+    TAXONOMY_CACHE_MAX_AGE_DAYS,    
     TEMPLATE_FIELD_MAPPING,
     UTILITY_FILES_DIR
 )
 from process_mods import check_if_agent_field
 from taxonomy_manager import (
     TAXONOMIES,
+    get_taxonomy_cache_age,
     load_taxonomies,
 )
 from utilities import (
@@ -114,6 +126,18 @@ from utilities import (
 DEFAULT_BATCH_SIZE = 10000
 LOGGER_NAME = LogRegistry.MAKE_INGEST_SHEET
 
+# Object models that are always top-level; any parent_id on these is ignored
+TOP_LEVEL_MODELS = ('Paged Content', 'Compound Object', 'Newspaper')
+
+# Columns holding files for Workbench's additional_files setting. Each one
+# needs a matching commented entry in default_create_config.yml, such as
+# "# - transcript: 9", where the number is the Media Use term ID.
+ADDITIONAL_FILE_COLUMNS = ('transcript', 'thumbnail', 'hocr', 'extracted_text')
+
+# Columns whose values are file paths or URLs for Workbench to fetch. They
+# are not Drupal field values, so the 255-character text limit doesn't apply.
+FILE_REFERENCE_COLUMNS = ('file',) + ADDITIONAL_FILE_COLUMNS
+
 
 # ---------------------------------------------------------------------------
 # Classes
@@ -128,6 +152,7 @@ class AppConfig:
     batch_size: int
     export_id: str | None
     metadata_id: str | None
+    id_column: str
     credentials_file: str
     ingest_task: str
     metadata_level: str
@@ -135,6 +160,7 @@ class AppConfig:
     remove_pages: bool
     export_sheet: str | None = None
     metadata_sheet: str | None = None
+    metadata_tab: str | None = None
     refresh_taxonomies: bool = False
     batch_dir: str | None = None
     timestamp: str | None = None
@@ -243,6 +269,24 @@ class ProcessingResult:
         self.current_batch += 1
 
 
+class PrefixedValue(str):
+    """String that remembers the vocabulary prefix and bare term it holds.
+ 
+    Behaves exactly like the combined string (``prefix + term``) for joining,
+    comparison, and output, but keeps the two parts separate so that
+    de-duplication never has to guess where a prefix ends. Parsing the
+    combined string by splitting on ``:`` is unreliable because the bare term
+    itself may contain colons (e.g. ``Sound recording: musical``).
+    """
+ 
+    def __new__(cls, term: str, prefix: str | None = None):
+        prefix = prefix or ''
+        obj = super().__new__(cls, f'{prefix}{term}')
+        obj.term = term
+        obj.prefix = prefix
+        return obj
+
+
 @dataclass(frozen=True)
 class FieldMapping:
     """Islandora field mapping information for a source CSV field."""
@@ -256,6 +300,71 @@ class FieldMapping:
     def is_mapped(self) -> bool:
         """Return whether a mapping was found."""
         return self.field is not None
+
+
+@dataclass(frozen=True)
+class MappingResolution:
+    """Outcome of resolving a source CSV field against the mapping tables.
+
+    Resolution depends only on the CSV field name, so it is computed once per
+    field and cached for the run. Anything worth logging is stored here
+    rather than logged during the lookup; it is logged per record, and only
+    for records that actually have data in the field.
+    """
+
+    mapping: FieldMapping = field(default_factory=FieldMapping)
+
+    # Linked-agent lookup details (role-based columns such as
+    # "photographer_person")
+    agent_role_term: str | None = None
+    agent_issue: str | None = None
+    relator_code: str | None = None
+    relator_note: str | None = None
+
+    # How an unmatched field was ultimately handled: "i2_field" when the
+    # name is itself an I2 field, "unmapped" when it is dropped
+    fallback: str | None = None
+
+
+@dataclass
+class FamilyOrder:
+    """Ingest sheet rows arranged so parents precede their children.
+
+    All per-row lists and dictionaries use positions in the reordered
+    ``sheet``, not the original row order.
+    """
+
+    # Ingest sheet in processing order
+    sheet: pd.DataFrame
+
+    # True for the last row of each family; batches may only end here
+    family_end: list[bool] = field(default_factory=list)
+
+    # Cleaned record identifier for each row
+    keys: list[str] = field(default_factory=list)
+
+    # Cleaned parent identifier for each row ('' for top-level rows)
+    parents: list[str] = field(default_factory=list)
+
+    # Rows whose parent_id matches no record in the sheet
+    unresolved_parents: set[int] = field(default_factory=set)
+
+    # Rows caught in a circular parent_id reference
+    circular: set[int] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class TaxonomyLookup:
+    """Taxonomy terms indexed by vocabulary for fast validation."""
+
+    # Vocabulary -> every term name in it
+    names: dict[str, frozenset[str]]
+
+    # Vocabulary -> every term ID in it
+    term_ids: dict[str, frozenset[str]]
+
+    # Vocabulary -> term ID -> name of the first term with that ID
+    id_to_name: dict[str, dict[str, str]]
 
 
 # ---------------------------------------------------------------------------
@@ -318,9 +427,22 @@ def parse_arguments() -> AppConfig:
         help="Google Sheet ID for the metadata file.",
     )
     parser.add_argument(
+        '--metadata_tab',
+        type=str,
+        help=(
+            "Tab name within the metadata Google Sheet. Defaults to the "
+            "first tab. Only valid with --metadata_id."
+        ),
+    )
+    parser.add_argument(
         '--metadata_sheet',
         type=str,
         help="Path to metadata sheet on local device.",
+    )
+    parser.add_argument(
+        '--id-column',
+        type=str,
+        help="Metadata sheet column that contains the record identifier.",
     )
     parser.add_argument(
         '-c',
@@ -374,6 +496,11 @@ def parse_arguments() -> AppConfig:
             "Enter the Google Sheet ID for the metadata sheet: "
         )
 
+    if not args.id_column:
+        args.id_column = prompt_for_input(
+            "Enter the metadata sheet column name used as the identifier: "
+        )
+
     if not args.metadata_level:
         args.metadata_level = prompt_for_input(
             "Enter the metadata level (minimal, complete, or publish): ",
@@ -397,6 +524,11 @@ def parse_arguments() -> AppConfig:
     if args.metadata_id and args.metadata_sheet:
         raise ValueError(
             "Provide either --metadata_id or --metadata_sheet, not both."
+        )
+
+    if args.metadata_tab and not args.metadata_id:
+        raise ValueError(
+            "--metadata_tab can only be used with --metadata_id."
         )
 
     args.publish = args.publish == 'y'
@@ -436,12 +568,13 @@ def load_input_sheets(config: AppConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     if config.metadata_id:
         logger.info(
-            "Using metadata sheet from Google ID: %s",
+            "Using metadata sheet from Google ID: %s (tab: %s)",
             config.metadata_id,
+            config.metadata_tab or 'first tab',
         )
         metadata_df = read_google_sheet(
             config.metadata_id,
-            sheet_name=config.metadata_sheet,
+            sheet_name=config.metadata_tab,
             credentials_file=config.credentials_file,
         )
     elif config.metadata_sheet:
@@ -459,20 +592,42 @@ def load_input_sheets(config: AppConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 # --- Sheet Merging ---
 
+def validate_id_column(metadata_df: pd.DataFrame, id_column: str) -> None:
+    """Confirm that the metadata sheet contains the identifier column.
+
+    Args:
+        metadata_df: Human-editable metadata sheet.
+        id_column: Name of the column that holds the record identifier.
+
+    Raises:
+        ValueError: If the column is not in the metadata sheet.
+    """
+    if id_column not in metadata_df.columns:
+        available = ', '.join(map(str, metadata_df.columns))
+        message = (
+            f"Identifier column '{id_column}' was not found in the metadata "
+            f"sheet. Available columns: {available}"
+        )
+        logging.getLogger(LOGGER_NAME).error(message)
+        raise ValueError(message)
+
+
 def merge_sheets(
     export_df: pd.DataFrame,
     metadata_df: pd.DataFrame,
+    id_column: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Add Workbench node IDs to a metadata sheet.
 
     The metadata sheet is treated as the authoritative source. The export
     sheet contributes only the system-generated ``node_id``, matched using the
-    export's ``id`` column and either ``identifier`` or ``id`` in the metadata
-    sheet. The metadata sheet's original identifier column name is preserved.
+    export's ``id`` column and the metadata sheet's ``id_column``. The metadata
+    sheet's original identifier column name is preserved.
 
     Args:
         export_df: Workbench export containing ``id`` and ``node_id``.
         metadata_df: Human-editable metadata sheet.
+        id_column: Metadata sheet column that holds the record identifier.
 
     Returns:
         Tuple containing:
@@ -481,9 +636,9 @@ def merge_sheets(
 
     Raises:
         KeyError: If the export is missing ``id`` or ``node_id``.
-        ValueError: If the metadata sheet is missing both ``identifier`` and
-            ``id``, either input contains blank normalized identifiers, or
-            either input contains duplicate normalized identifiers.
+        ValueError: If the metadata sheet is missing ``id_column``, either
+            input contains blank normalized identifiers, or either input
+            contains duplicate normalized identifiers.
     """
     logger = logging.getLogger(LOGGER_NAME)
 
@@ -513,22 +668,9 @@ def merge_sheets(
         ['id', 'node_id']
     ].copy()
 
-    # Identify the metadata identifier field
-    if 'identifier' in metadata_df.columns:
-        metadata_id_field = 'identifier'
-    elif 'id' in metadata_df.columns:
-        metadata_id_field = 'id'
-        logger.info(
-            "Preferred metadata join field 'identifier' was not found; "
-            "using fallback field 'id'."
-        )
-    else:
-        message = (
-            "Metadata sheet is missing the required join column "
-            "'identifier' (or fallback 'id')."
-        )
-        logger.error(message)
-        raise ValueError(message)
+    # Confirm the metadata identifier field exists
+    validate_id_column(metadata_df, id_column)
+    metadata_id_field = id_column
 
     logger.info(
         "Using '%s' as the metadata join field.",
@@ -705,12 +847,200 @@ def merge_sheets(
 
 # --- Batch Helpers ---
 
+def order_records_by_family(
+    ingest_sheet: pd.DataFrame,
+    id_column: str,
+    use_hierarchy: bool = True,
+) -> FamilyOrder:
+    """Arrange ingest sheet rows so every parent precedes its children.
+
+    Workbench can only resolve a ``parent_id`` that refers to an ``id``
+    earlier in the same CSV, so each top-level record is followed directly
+    by all of its descendants. Siblings are ordered by ``field_weight``
+    when any of them has one, with unweighted siblings after the weighted
+    ones in sheet order. When none of the siblings has a ``field_weight``,
+    they are ordered by ``node_id`` instead, then by sheet order.
+
+    A record whose ``parent_id`` matches nothing in the sheet (for example,
+    a child of an object that already exists in Drupal) is treated as the
+    start of its own family and flagged in the result. Records caught in a
+    circular reference are flagged and placed last, in sheet order.
+
+    Sheets without a ``parent_id`` column are returned unchanged, as are
+    all sheets when ``use_hierarchy`` is False.
+
+    Args:
+        ingest_sheet: Ingest sheet in original row order.
+        id_column: Column that holds the record identifier.
+        use_hierarchy: Whether parent_id should be used. When False, rows
+            keep their original order and are treated as unrelated.
+
+    Returns:
+        FamilyOrder with the reordered sheet and per-row family details.
+    """
+    row_count = len(ingest_sheet)
+
+    if (
+        row_count == 0
+        or not use_hierarchy
+        or 'parent_id' not in ingest_sheet.columns
+    ):
+        return FamilyOrder(
+            sheet=ingest_sheet,
+            family_end=[True] * row_count,
+            keys=[''] * row_count,
+            parents=[''] * row_count,
+        )
+
+    def cleaned_column(column: str) -> list[str]:
+        if column not in ingest_sheet.columns:
+            return [''] * row_count
+
+        return [
+            '' if pd.isna(value) else remove_whitespaces(str(value))
+            for value in ingest_sheet[column]
+        ]
+
+    def numeric_column(column: str) -> list[float]:
+        if column not in ingest_sheet.columns:
+            return [float('nan')] * row_count
+
+        return pd.to_numeric(
+            ingest_sheet[column],
+            errors='coerce',
+        ).tolist()
+
+    keys = cleaned_column(id_column)
+    models = cleaned_column('field_model')
+    weights = numeric_column('field_weight')
+    node_ids = numeric_column('node_id')
+
+    # parent_id is repeatable in the schema, but a record has one parent
+    parents = []
+
+    for value in cleaned_column('parent_id'):
+        tokens = split_and_clean(value)
+        parents.append(tokens[0] if tokens else '')
+
+    # Top-level models never have a parent, whatever the sheet says
+    parents = [
+        '' if models[i] in TOP_LEVEL_MODELS else parent
+        for i, parent in enumerate(parents)
+    ]
+
+    first_position = {}
+
+    for position, key in enumerate(keys):
+        if key and key not in first_position:
+            first_position[key] = position
+
+    children = {}
+
+    for position, parent in enumerate(parents):
+        if parent:
+            children.setdefault(parent, []).append(position)
+
+    def order_siblings(positions: list[int]) -> list[int]:
+        """Order a group of siblings by weight, or else by node ID."""
+        sort_values = (
+            weights
+            if any(not pd.isna(weights[p]) for p in positions)
+            else node_ids
+        )
+
+        return sorted(
+            positions,
+            key=lambda p: (
+                pd.isna(sort_values[p]),
+                0 if pd.isna(sort_values[p]) else sort_values[p],
+                p,
+            ),
+        )
+
+    visited = set()
+
+    def collect_family(start: int) -> list[int]:
+        """Return a record followed by all of its descendants."""
+        family = []
+        stack = [start]
+
+        while stack:
+            position = stack.pop()
+
+            if position in visited:
+                continue
+
+            visited.add(position)
+            family.append(position)
+
+            if keys[position]:
+                siblings = order_siblings(children.get(keys[position], []))
+                stack.extend(reversed(siblings))
+
+        return family
+
+    families = []
+    unresolved = set()
+    emitted_orphan_groups = set()
+
+    for position in range(row_count):
+        parent = parents[position]
+
+        if not parent:
+            if position not in visited:
+                families.append(collect_family(position))
+
+        elif parent not in first_position:
+            # Parent is not in this sheet. Records that share a missing
+            # parent are siblings, so order them together, at the point
+            # where the first of them appears.
+            if parent in emitted_orphan_groups:
+                continue
+
+            emitted_orphan_groups.add(parent)
+
+            for member in order_siblings(children[parent]):
+                unresolved.add(member)
+
+                if member not in visited:
+                    families.append(collect_family(member))
+
+    # Anything left is part of, or hangs from, a circular reference
+    circular = {
+        position for position in range(row_count) if position not in visited
+    }
+
+    for position in sorted(circular):
+        families.append([position])
+
+    order = [position for family in families for position in family]
+    family_end = []
+
+    for family in families:
+        family_end.extend([False] * (len(family) - 1) + [True])
+
+    new_position = {original: new for new, original in enumerate(order)}
+
+    return FamilyOrder(
+        sheet=ingest_sheet.iloc[order],
+        family_end=family_end,
+        keys=[keys[original] for original in order],
+        parents=[parents[original] for original in order],
+        unresolved_parents={new_position[p] for p in unresolved},
+        circular={new_position[p] for p in circular},
+    )
+
+
 def should_flush_batch(buffer: list, batch_size: int) -> bool:
-    """Determine whether the current batch should be flushed to disk.
+    """Determine whether the current batch is large enough to flush.
+
+    This is a minimum, not a hard limit. Callers only flush at the end of
+    a family of records, so a batch can exceed ``batch_size`` rather than
+    split a parent from its children.
 
     Args:
         buffer: Processed record buffer.
-        batch_size: Maximum number of records in a batch.
+        batch_size: Number of records at which a batch may be flushed.
 
     Returns:
         True if batch should be flushed; otherwise False.
@@ -734,7 +1064,8 @@ def flush_batch(
         DataFrame written from the record buffer.
     """
     sub_batch_prefix = (
-        f'{config.batch_dir}_{batch_count}_ingest_{config.metadata_level}'
+        f'{config.file_prefix}_{batch_count}_'
+        f'{config.ingest_task}_{config.metadata_level}'
     )
     sub_batch_file = f'{sub_batch_prefix}.csv'
     sub_batch_path = config.output_dir / sub_batch_file
@@ -745,10 +1076,10 @@ def flush_batch(
         return pd.DataFrame()
 
     # Check for additional media files
-    media_files = []
-
-    if 'transcript' in records_df.columns:
-        media_files.append('transcript')
+    media_files = [
+        column for column in ADDITIONAL_FILE_COLUMNS
+        if column in records_df.columns
+    ]
 
     # Prepare config file
     prepare_config(
@@ -793,25 +1124,17 @@ def save_records(
     # Filter fields to those allowable by ingest task
     records_df = filter_fields(records_df, config.ingest_task)
 
-    # Sort records so that parent objects are first
+    # Ensure that parent_id is empty for top-level object models. Records
+    # arrive already ordered with parents before children (see
+    # order_records_by_family), so they are not re-sorted here.
     if (
         'parent_id' in records_df.columns
         and 'field_model' in records_df.columns
     ):
-        # Ensure that parent_id is empty for top-level object models
-        parent_models = ['Paged Content', 'Compound Object', 'Newspaper']
-
         records_df.loc[
-            records_df['field_model'].isin(parent_models),
+            records_df['field_model'].isin(TOP_LEVEL_MODELS),
             'parent_id',
         ] = pd.NA
-
-        records_df.sort_values(
-            by='parent_id',
-            ascending=True,
-            na_position='first',
-            inplace=True,
-        )
 
     # Write the resulting DataFrame to a CSV file
     df_to_csv(records_df, destination)
@@ -872,12 +1195,14 @@ def prepare_config(
         Path to the customized config file, or None if the default config is
         missing.
     """
-    # Load environment variable right where it's needed
-    load_dotenv()
+    logger = logging.getLogger(LOGGER_NAME)
+
+    # The project's .env file is loaded when definitions.py is imported
     import_password = os.getenv('ISLANDORA_PASSWORD', '')
 
-    # Define source and destination config paths
-    default_config = 'default_create_config.yml'
+    # Define source and destination config paths. Each ingest task has its
+    # own template, e.g. default_create_config.yml or default_update_config.yml
+    default_config = f'default_{ingest_task}_config.yml'
     config_src = UTILITY_FILES_DIR / default_config
     config_filename = f'{batch_prefix}.yml'
     config_dest = batch_path / 'configs' / config_filename
@@ -887,11 +1212,23 @@ def prepare_config(
 
     # Read and update placeholders from default config
     if not config_src.exists():
-        print('default_create_config.yml not found in Utility_Files.')
+        message = (
+            f"{default_config} not found in Utility_Files; no config file "
+            "was written for this batch."
+        )
+        logger.error(message)
+        print(message)
         return None
 
     with config_src.open('r', encoding='utf-8') as f:
         content = f.read()
+
+    if '[ISLANDORA_PASSWORD]' in content and not import_password:
+        logger.warning(
+            "ISLANDORA_PASSWORD is not set, so the password in %s will be "
+            "blank.",
+            config_dest.name,
+        )
 
     # Replace placeholders
     content = content.replace('[ISLANDORA_PASSWORD]', import_password)
@@ -901,15 +1238,30 @@ def prepare_config(
     content = content.replace('[USER_ID]', user_id)
     content = content.replace('[INGEST_TASK]', ingest_task)
 
-    # Uncomment additional media file types in batch
-    if media_files:
-        content = content.replace('#additional_files', 'additional_files')
+    # Uncomment the additional media file types used in this batch
+    enabled_media_files = []
 
-    for field, comment in {
-        'transcript': '# - transcript'  # Can extend list as needed
-    }.items():
-        if field in media_files:
-            content = content.replace(comment, comment[2:])
+    for column in ADDITIONAL_FILE_COLUMNS:
+        if column not in media_files:
+            continue
+
+        comment = f'# - {column}'
+
+        if comment not in content:
+            logger.warning(
+                "%s has no '%s' entry, so the '%s' column will not be "
+                "configured as an additional file.",
+                default_config,
+                comment,
+                column,
+            )
+            continue
+
+        content = content.replace(comment, comment[2:])
+        enabled_media_files.append(column)
+
+    if enabled_media_files:
+        content = content.replace('#additional_files', 'additional_files')
 
     # Write the customized config to the destination
     with config_dest.open('w', encoding='utf-8') as f:
@@ -1007,7 +1359,25 @@ def filter_fields(
             "Expected 'create' or 'update'."
         )
 
-    disallowed_fields = DISALLOWED_FIELDS_BY_INGEST_TASK[ingest_task]
+    disallowed_fields = set(DISALLOWED_FIELDS_BY_INGEST_TASK[ingest_task])
+
+    # Update tasks change node fields only. Files are added or replaced with
+    # other Workbench tasks (e.g., add_media and update_media), and Workbench
+    # rejects CSV columns that aren't Drupal fields, so file columns never
+    # belong in an update CSV.
+    if ingest_task == 'update':
+        dropped_files = [
+            column for column in FILE_REFERENCE_COLUMNS
+            if column in records.columns
+        ]
+
+        if dropped_files:
+            logging.getLogger(LOGGER_NAME).info(
+                "Removed file column(s) from the update ingest sheet: %s.",
+                ', '.join(dropped_files),
+            )
+
+        disallowed_fields |= set(FILE_REFERENCE_COLUMNS)
 
     fields_to_drop = [
         field for field in disallowed_fields
@@ -1112,103 +1482,86 @@ def is_repeatable_field(field: str | None) -> bool:
     return match.iat[0] == 'TRUE'
 
 
-def get_agent_data(
-    result: ProcessingResult,
-    pid: str,
-    field: str,
-) -> tuple[str, str] | bool:
-    """Resolve linked-agent taxonomy and prefix from a mapped field.
+def resolve_agent_data(csv_field: str) -> MappingResolution | None:
+    """Resolve linked-agent taxonomy and prefix from a CSV field name.
+
+    This only looks values up; any issue or transformation it finds is
+    returned in the resolution so it can be logged later, per record.
 
     Args:
-        result: Runtime processing result.
-        pid: Record PID.
-        field: CSV field name.
+        csv_field: CSV field name.
 
     Returns:
-        Tuple of taxonomy and prefix, or False if field is not agent-like.
+        Resolution with the linked-agent mapping on success, a resolution
+        describing the failure when the field looks like an agent field but
+        cannot be resolved, or None if the field is not agent-like.
     """
-    if not field or '_' not in field:
-        return False
-    
+    if not csv_field or '_' not in csv_field:
+        return None
+
     # Agent-related CSV columns follow a "{role}_{agent_type}" naming
     # convention in the metadata sheet, e.g. "photographer_person" or
     # "sponsor_corporate". Splitting on the last underscore separates the
     # relator role (which may itself contain underscores) from the agent
     # type suffix.
-    role_term, agent_type = field.rsplit('_', 1)
+    role_term, agent_type = csv_field.rsplit('_', 1)
     role_term = role_term.replace('_', ' ')
 
     relator = RELATOR_TERMS.get(role_term)
 
     if not relator:
-        result.log_issue(
-            pid,
-            field,
-            role_term,
-            "could not find relator term",
+        return MappingResolution(
+            agent_role_term=role_term,
+            agent_issue="could not find relator term",
         )
-        return False
 
     relator_code = relator['code']
-    note = relator['note']
-
-    if note:
-        result.log_transformation(
-            pid,
-            field,
-            role_term,
-            relator_code,
-            note,
-        )
-        logging.getLogger(LOGGER_NAME).warning(
-            "Record %s: Relator code %s - %s",
-            pid,
-            relator_code,
-            note,
-        )
+    relator_note = relator['note'] or None
 
     agent_type = LINKED_AGENT_TYPES.get(agent_type)
 
     if not agent_type:
-        result.log_issue(
-            pid,
-            field,
-            role_term,
-            "could not determine linked agent type",
+        return MappingResolution(
+            agent_role_term=role_term,
+            agent_issue="could not determine linked agent type",
+            relator_code=relator_code,
+            relator_note=relator_note,
         )
-        return False
 
-    taxonomy = agent_type.replace('_', ' ').title()
-    prefix = f'relators:{relator_code}:{agent_type}:'
+    return MappingResolution(
+        mapping=FieldMapping(
+            field='field_linked_agent',
+            taxonomy=agent_type.replace('_', ' ').title(),
+            prefix=f'relators:{relator_code}:{agent_type}:',
+            repeatable=is_repeatable_field('field_linked_agent'),
+        ),
+        agent_role_term=role_term,
+        relator_code=relator_code,
+        relator_note=relator_note,
+    )
 
-    return taxonomy, prefix
 
-
-def get_mapped_field(
-    result: ProcessingResult,
-    pid: str,
-    csv_field: str,
-    data: str,
-) -> FieldMapping:
-    """Return the Islandora field mapping for a source CSV field.
+@lru_cache(maxsize=None)
+def resolve_column_mapping(csv_field: str) -> MappingResolution:
+    """Resolve a source CSV field to its Islandora field mapping.
 
     Searches the template, manifest, and MARC field mapping tables for the
-    supplied CSV field. If no direct mapping is found, linked-agent fields are
-    handled separately. Any unmapped field is logged as an issue.
+    supplied CSV field. If no direct mapping is found, linked-agent fields
+    are handled separately, then fields that are themselves I2 fields.
+
+    The result depends only on the field name and the mapping tables, which
+    are fixed for the run, so it is cached. This function never logs.
 
     Args:
-        result: Runtime processing result.
-        pid: Current record PID.
         csv_field: Source CSV field.
-        data: Source cell value.
 
     Returns:
-        FieldMapping object containing the mapped Islandora field, taxonomy,
-        prefix, and repeatability. If no mapping is found, all optional
-        attributes will be None and ``repeatable`` will be False.
+        MappingResolution containing the FieldMapping and any details to
+        log. If no mapping is found, the FieldMapping has all optional
+        attributes set to None and ``repeatable`` False.
     """
     if csv_field in SCAN_BATCH_DIR_FIELDS:
-        return FieldMapping()
+        return MappingResolution()
 
     mapping_columns = [
         'machine_name',
@@ -1231,7 +1584,7 @@ def get_mapped_field(
 
         row = match.iloc[0]
 
-        field = (
+        mapped_field = (
             None
             if pd.isna(row['machine_name'])
             else row['machine_name']
@@ -1253,31 +1606,84 @@ def get_mapped_field(
             has_capitals = any(char.isupper() for char in prefix)
             prefix = f"{prefix} " if has_capitals else prefix
 
-        return FieldMapping(
-            field=field,
-            taxonomy=taxonomy,
-            prefix=prefix,
-            repeatable=is_repeatable_field(field),
-        )
-
-    if check_if_agent_field(csv_field):
-        agent_data = get_agent_data(result, pid, csv_field)
-
-        if agent_data:
-            taxonomy, prefix = agent_data
-            field = 'field_linked_agent'
-
-            return FieldMapping(
-                field=field,
+        return MappingResolution(
+            mapping=FieldMapping(
+                field=mapped_field,
                 taxonomy=taxonomy,
                 prefix=prefix,
-                repeatable=is_repeatable_field(field),
+                repeatable=is_repeatable_field(mapped_field),
             )
+        )
+
+    agent_resolution = None
+
+    if check_if_agent_field(csv_field):
+        agent_resolution = resolve_agent_data(csv_field)
+
+        if agent_resolution and agent_resolution.mapping.is_mapped:
+            return agent_resolution
+
+    # Keep any failed agent lookup details so they are still reported
+    base = agent_resolution or MappingResolution()
 
     # TODO: Support taxonomy and prefix matching by updating I2 field schema
     match = FIELDS.loc[FIELDS['Field'] == csv_field]
 
     if not match.empty:
+        return replace(
+            base,
+            mapping=FieldMapping(
+                field=csv_field,
+                taxonomy=None,
+                prefix=None,
+                repeatable=is_repeatable_field(csv_field),
+            ),
+            fallback='i2_field',
+        )
+
+    return replace(base, fallback='unmapped')
+
+
+def log_mapping_resolution(
+    result: ProcessingResult,
+    pid: str,
+    csv_field: str,
+    data: str,
+    resolution: MappingResolution,
+) -> None:
+    """Log the issues and transformations found while resolving a field.
+
+    Args:
+        result: Runtime processing result.
+        pid: Current record PID.
+        csv_field: Source CSV field.
+        data: Source cell value.
+        resolution: Cached resolution for the field.
+    """
+    if resolution.relator_note:
+        result.log_transformation(
+            pid,
+            csv_field,
+            resolution.agent_role_term,
+            resolution.relator_code,
+            resolution.relator_note,
+        )
+        logging.getLogger(LOGGER_NAME).warning(
+            "Record %s: Relator code %s - %s",
+            pid,
+            resolution.relator_code,
+            resolution.relator_note,
+        )
+
+    if resolution.agent_issue:
+        result.log_issue(
+            pid,
+            csv_field,
+            resolution.agent_role_term,
+            resolution.agent_issue,
+        )
+
+    if resolution.fallback == 'i2_field':
         result.log_issue(
             pid,
             csv_field,
@@ -1288,26 +1694,49 @@ def get_mapped_field(
                 "are correct."
             ),
         )
-
-        return FieldMapping(
-            field=csv_field,
-            taxonomy=None,
-            prefix=None,
-            repeatable=is_repeatable_field(csv_field),
+    elif resolution.fallback == 'unmapped':
+        result.log_issue(
+            pid,
+            csv_field,
+            data,
+            "could not find matching I2 field",
+            (
+                f"Could not find matching I2 field for CSV field "
+                f"'{csv_field}' with data '{data}'. Dropping column."
+            ),
         )
 
-    result.log_issue(
-        pid,
-        csv_field,
-        data,
-        "could not find matching I2 field",
-        (
-            f"Could not find matching I2 field for CSV field "
-            f"'{csv_field}' with data '{data}'. Dropping column."
-        ),
-    )
 
-    return FieldMapping()
+def get_mapped_field(
+    result: ProcessingResult,
+    pid: str,
+    csv_field: str,
+    data: str,
+) -> FieldMapping:
+    """Return the Islandora field mapping for a source CSV field.
+
+    The lookup itself is cached per field name. Issues and transformations
+    found during the lookup are logged for this record only when the cell
+    has data, so blank cells in unmapped or special columns don't add noise
+    to the reports.
+
+    Args:
+        result: Runtime processing result.
+        pid: Current record PID.
+        csv_field: Source CSV field.
+        data: Source cell value.
+
+    Returns:
+        FieldMapping object containing the mapped Islandora field, taxonomy,
+        prefix, and repeatability. If no mapping is found, all optional
+        attributes will be None and ``repeatable`` will be False.
+    """
+    resolution = resolve_column_mapping(csv_field)
+
+    if not pd.isna(data) and str(data).strip():
+        log_mapping_resolution(result, pid, csv_field, data, resolution)
+
+    return resolution.mapping
 
 
 # --- Record Building Helpers ---
@@ -1382,33 +1811,25 @@ def add_value(
         # "Still Image" directly) and once prefixed (e.g. from a mapped CSV
         # column that attaches a vocabulary prefix like "resource_type:").
         #
-        # Every controlled field's prefix has a single trailing colon
-        # (e.g. "resource_types:"), and the prefix never contains a colon
-        # other than the trailing colon, so a stored entry's bare term can 
-        # be recovered just by splitting off everything after the first colon.
-  
-        def bare_form(entry: str) -> str:
-            return entry.rsplit(':', 1)[-1] if ':' in entry else entry
+        # Stored entries are PrefixedValue objects, which carry their bare
+        # term and prefix separately. Entries are compared on the bare term
+        # directly rather than by parsing the combined string, so terms that
+        # themselves contain colons are handled correctly.
+        value = PrefixedValue(unprefixed_value, prefix)
 
         stored = next(
-            (v for v in values if bare_form(v) == unprefixed_value),
+            (
+                v for v in values 
+                if getattr(v, 'term', v) == unprefixed_value
+            ),
             None,
         )
 
         if stored is None:
             values.append(value)
-        elif value != stored:
-            incoming_is_prefixed = value != unprefixed_value
-            stored_is_prefixed = stored != unprefixed_value
+        elif value.prefix and not getattr(stored, 'prefix', ''):
+            values[values.index(stored)] = value
 
-            if incoming_is_prefixed and not stored_is_prefixed:
-                # A bare form is stored; the prefixed form just arrived
-                # and takes precedence, so replace the bare entry.
-                values[values.index(stored)] = value
-            # else: incoming is bare while a prefixed form is already
-            # stored (keep the prefixed form), or both are differently
-            # prefixed variants (keep whichever was seen first) —
-            # either way, drop the incoming value.
     record[field] = values
 
     return value
@@ -1445,7 +1866,10 @@ def process_title(
     Args:
         result: Runtime processing result.
         record: Record being updated.
-        title_parts: Title components.
+        title_parts: Title components, keyed by source CSV field name.
+            Recognized keys are ``title``, ``volume``, and ``issue`` (the
+            metadata template's header). ``number`` is also accepted as an
+            alternate name for the issue.
 
     Returns:
         Formatted title, if created.
@@ -1453,11 +1877,14 @@ def process_title(
     title = title_parts.get('title')
 
     if title:
-        if title_parts.get('volume'):
-            title += f", vol. {title_parts.get('volume')}"
+        volume = title_parts.get('volume')
+        issue = title_parts.get('issue') or title_parts.get('number')
 
-        if title_parts.get('number'):
-            title += f", no. {title_parts.get('number')}"
+        if volume:
+            title += f", vol. {volume}"
+
+        if issue:
+            title += f", no. {issue}"
 
         add_title(result, record, title)
 
@@ -1466,38 +1893,127 @@ def process_title(
 
 # --- Validation Helpers ---
 
-@lru_cache(maxsize=500)
-def _check_network_status(value: str) -> tuple[bool, str]:
-    """Perform cached HTTP validation for a collection node ID.
+class CollectionNodeChecker:
+    """Check that collection nodes exist, remembering only definite answers.
 
-    Args:
-        value: Node ID to check.
-
-    Returns:
-        Tuple containing validation status and error description.
+    A node that exists, or definitely doesn't, is remembered for the rest of
+    the run. A network problem (a timeout, a server error, too many requests)
+    says nothing about the node, so it is never remembered. A failed request
+    is retried a couple of times first, since most problems are brief. If it
+    keeps failing, checking pauses for a cooldown period, so an outage doesn't
+    make every record wait for a timeout and isn't blamed on the collection.
     """
-    url = f'https://digital.library.pitt.edu/node/{value}'
 
-    try:
-        response = requests.head(url, allow_redirects=True, timeout=10)
+    BASE_URL = 'https://digital.library.pitt.edu/node/'
+    VALID = 'valid'
+    INVALID = 'invalid'
+    UNVERIFIED = 'unverified'
 
-        if response.status_code == 404: # Page Not Found - node doesn't exist
-            return False, f"URL returned 404: {url}"
+    def __init__(
+        self,
+        timeout: int = 10,
+        retries: int = 2,
+        backoff: float = 1.0,
+        cooldown: float = 60.0,
+    ) -> None:
+        self.timeout = timeout
+        self.retries = retries
+        self.backoff = backoff
+        self.cooldown = cooldown
+        self._answers: dict[str, tuple[str, str]] = {}
+        self._paused_until = 0.0
 
-        if response.status_code in {
-            200, # OK - published
-            301, # Moved Permanently - redirect to published collection page
-            403, # Forbidden - unpublised collection page
-        }:
-            return True, ''
+    def check(self, value: str) -> tuple[str, str]:
+        """Check a collection node ID.
 
-        return False, f"Unexpected status code {response.status_code}: {url}"
+        Args:
+            value: Node ID to check.
 
-    except requests.exceptions.RequestException as error:
-        msg = "HTTP request failed"
-        logging.getLogger(LOGGER_NAME).exception(msg)
+        Returns:
+            Tuple of status (VALID, INVALID, or UNVERIFIED) and a message
+            describing any problem.
+        """
+        if value in self._answers:
+            return self._answers[value]
 
-        return False, f"{msg}: {str(error)}"
+        if time.monotonic() < self._paused_until:
+            return (
+                self.UNVERIFIED,
+                "network checks are paused after a recent failure",
+            )
+
+        url = f'{self.BASE_URL}{value}'
+        problem = ''
+
+        for attempt in range(self.retries + 1):
+            if attempt:
+                time.sleep(self.backoff * attempt)
+
+            try:
+                response = requests.head(
+                    url,
+                    allow_redirects=True,
+                    timeout=self.timeout,
+                )
+            except requests.exceptions.RequestException as error:
+                problem = f"HTTP request failed: {error}"
+                continue
+
+            status_code = response.status_code
+
+            # The server is busy or failing, so this says nothing about the
+            # node. Try again.
+            if status_code == 429 or status_code >= 500:
+                problem = f"server returned {status_code}: {url}"
+                continue
+
+            if status_code in {
+                200, # OK - published
+                301, # Moved Permanently - redirect to published collection
+                403, # Forbidden - unpublished collection page
+            }:
+                return self._remember(value, self.VALID, '')
+
+            if status_code == 404: # Page Not Found - node doesn't exist
+                return self._remember(
+                    value,
+                    self.INVALID,
+                    f"URL returned 404: {url}",
+                )
+
+            return self._remember(
+                value,
+                self.INVALID,
+                f"Unexpected status code {status_code}: {url}",
+            )
+
+        return self._pause(problem)
+
+    def _remember(
+        self,
+        value: str,
+        status: str,
+        message: str,
+    ) -> tuple[str, str]:
+        """Store a definite answer for a node ID."""
+        self._answers[value] = (status, message)
+
+        return status, message
+
+    def _pause(self, message: str) -> tuple[str, str]:
+        """Pause network checks after a failure, without remembering it."""
+        self._paused_until = time.monotonic() + self.cooldown
+        logging.getLogger(LOGGER_NAME).warning(
+            "Collection node check failed (%s). Pausing checks for %d "
+            "seconds; affected records are reported as unverified.",
+            message,
+            self.cooldown,
+        )
+
+        return self.UNVERIFIED, message
+
+
+COLLECTION_CHECKER = CollectionNodeChecker()
 
 
 def validate_collection_id(
@@ -1515,18 +2031,24 @@ def validate_collection_id(
     Returns:
         True if the collection node ID resolves; otherwise False.
     """
-    is_valid, error_msg = _check_network_status(value)
+    status, message = COLLECTION_CHECKER.check(value)
 
-    # Call the cached network function
-    if not is_valid:
-        result.log_issue(
-            pid,
-            'field_member_of',
-            value,
-            f"invalid collection node ID: {error_msg}",
-        )
+    if status == CollectionNodeChecker.VALID:
+        return True
 
-    return is_valid
+    if status == CollectionNodeChecker.UNVERIFIED:
+        issue = f"could not verify collection node ID: {message}"
+    else:
+        issue = f"invalid collection node ID: {message}"
+
+    result.log_issue(
+        pid,
+        'field_member_of',
+        value,
+        issue,
+    )
+
+    return False
 
 
 def validate_domain(
@@ -1734,6 +2256,58 @@ def validate_edtf_date(
         return True
 
 
+def build_taxonomy_lookup(taxonomies: pd.DataFrame) -> TaxonomyLookup:
+    """Index taxonomy terms by vocabulary.
+
+    Args:
+        taxonomies: Taxonomy table with ``Vocabulary``, ``Name``, and
+            ``Term ID`` columns.
+
+    Returns:
+        TaxonomyLookup built from the table.
+    """
+    names = {}
+    term_ids = {}
+    id_to_name = {}
+
+    for vocabulary, name, term_id in zip(
+        taxonomies['Vocabulary'],
+        taxonomies['Name'],
+        taxonomies['Term ID'],
+    ):
+        names.setdefault(vocabulary, set()).add(name)
+        term_ids.setdefault(vocabulary, set()).add(term_id)
+        id_to_name.setdefault(vocabulary, {}).setdefault(term_id, name)
+
+    return TaxonomyLookup(
+        names={vocab: frozenset(values) for vocab, values in names.items()},
+        term_ids={
+            vocab: frozenset(values) for vocab, values in term_ids.items()
+        },
+        id_to_name=id_to_name,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_taxonomy_lookup() -> TaxonomyLookup:
+    """Return the taxonomy index, building it on first use.
+
+    The index is built from the loaded taxonomy table. Call
+    ``get_taxonomy_lookup.cache_clear()`` if the table is reloaded.
+    """
+    return build_taxonomy_lookup(TAXONOMIES)
+
+
+@lru_cache(maxsize=None)
+def warn_unknown_taxonomy(taxonomy: str) -> None:
+    """Log once that a taxonomy name matches no loaded vocabulary."""
+    logging.getLogger(LOGGER_NAME).warning(
+        "Taxonomy '%s' was not found among the loaded vocabularies; every "
+        "term checked against it will be reported as missing.",
+        taxonomy,
+    )
+
+
 def validate_term(
     result: ProcessingResult,
     pid: str,
@@ -1753,20 +2327,17 @@ def validate_term(
     Returns:
         True if term is valid; otherwise False.
     """
-    mask = (
-        (TAXONOMIES['Name'] == value)
-        & (TAXONOMIES['Vocabulary'] == taxonomy)
+    lookup = get_taxonomy_lookup()
+
+    if taxonomy not in lookup.names:
+        warn_unknown_taxonomy(taxonomy)
+
+    found = (
+        value in lookup.names.get(taxonomy, ())
+        or value in lookup.term_ids.get(taxonomy, ())
     )
-    matching_rows = TAXONOMIES.loc[mask]
 
-    if matching_rows.empty:
-        mask = (
-            (TAXONOMIES['Term ID'] == value)
-            & (TAXONOMIES['Vocabulary'] == taxonomy)
-        )
-        matching_rows = TAXONOMIES.loc[mask]
-
-    if matching_rows.empty:
+    if not found:
         result.log_issue(
             pid,
             field,
@@ -1784,6 +2355,7 @@ def validate_record(
     record: dict,
     ingest_sheet: pd.DataFrame,
     ingest_task: str,
+    id_column: str,
 ) -> dict:
     """Validate fields and values in a metadata record.
 
@@ -1792,6 +2364,7 @@ def validate_record(
         record: Record to validate.
         ingest_sheet: Full ingest sheet.
         ingest_task: Ingest task.
+        id_column: Ingest sheet column that holds the record identifier.
 
     Returns:
         Validated record.
@@ -1813,7 +2386,10 @@ def validate_record(
 
         field_manager = match.iloc[0]
 
-        if field_manager.Field_Type == 'Text (plain)':
+        if (
+            field_manager.Field_Type == 'Text (plain)'
+            and field not in FILE_REFERENCE_COLUMNS
+        ):
             for value in values:
                 if len(value) > 255:
                     result.log_issue(
@@ -1870,10 +2446,12 @@ def validate_record(
             # to, so children stay visible on the same site(s) as their
             # parent.
             elif field == 'field_domain_access' and not record[field]:
-                parent_domains = get_parent_domain(
+                parent_domains = get_parent_values(
                     ingest_sheet,
                     pid,
                     parent_id,
+                    'field_domain_access',
+                    id_column,
                 )
 
                 for domain in parent_domains:
@@ -1884,9 +2462,41 @@ def validate_record(
                         'field_domain_access',
                         domain,
                     )
+                    
+            # The depositor isn't set independently per child either; it's
+            # inherited from the parent object, so a child is attributed to
+            # the same depositor as its parent.
+            elif field == 'field_depositor' and not record[field]:
+                parent_depositors = get_parent_values(
+                    ingest_sheet,
+                    pid,
+                    parent_id,
+                    'field_depositor',
+                    id_column,
+                )
+
+                # Apply the same vocabulary prefix the mapping tables give a
+                # depositor entered directly on a record (e.g.
+                # "contributing_institution:"), so inherited values match.
+                depositor_mapping = get_mapped_field(
+                    result,
+                    pid,
+                    'field_depositor',
+                    '',
+                )
+
+                for depositor in parent_depositors:
+                    add_value(
+                        result,
+                        record,
+                        None,
+                        'field_depositor',
+                        depositor,
+                        depositor_mapping.prefix,
+                    )
 
             # Skip since children do not get collection associations
-            elif field in METADATA_REQUIRED_FIELDS:
+            elif field == 'field_member_of':
                 continue
 
         missing_value = len(record[field]) < 1
@@ -1911,51 +2521,53 @@ def validate_record(
 
 # --- Field-Specific Processing ---
 
-def get_parent_domain(
+def get_parent_values(
     ingest_sheet: pd.DataFrame,
     pid: str,
     parent_id: str,
+    column: str,
+    id_column: str,
 ) -> list[str]:
-    """Inherit domain access values from a parent record.
+    """Inherit the values of a field from a parent record.
 
     Args:
         ingest_sheet: Master ingest DataFrame.
         pid: PID of the current child record.
         parent_id: PID of the parent record.
+        column: Ingest sheet column to read from the parent row (e.g.
+            ``field_domain_access`` or ``field_depositor``).
+        id_column: Ingest sheet column that holds the record identifier.
 
     Returns:
-        Parent domain values, if found.
+        Parent values for the column, if found.
     """
-    parent_domains = []
+    parent_values = []
 
     try:
-        id_column = (
-            'identifier' if 'identifier' in ingest_sheet.columns else 'id'
-        )
-        
-        # Locate parent row and extract the membership column
+        # Locate parent row and extract the requested column
         match = ingest_sheet.loc[
             ingest_sheet[id_column] == parent_id,
-            'field_domain_access',
+            column,
         ]
 
-        # Tokenize the URIs
+        # Tokenize the values
         if not match.empty and pd.notna(match.values[0]):
             extra_delimiters = (
-                ',' if 'field_domain_access' in COMMA_DELIMITED_FIELDS else ''
+                ',' if column in COMMA_DELIMITED_FIELDS else ''
             )
-            parent_domains = split_and_clean(
+            parent_values = split_and_clean(
                 str(match.values[0]),
                 extra_delimiters=extra_delimiters,
             )
 
     except Exception:
         logging.getLogger(LOGGER_NAME).exception(
-            "Record %s: Failed to retrieve parent domain.",
+            "Record %s: Failed to retrieve parent %s.",
             pid,
+            column,
         )
 
-    return parent_domains
+    return parent_values
 
 
 def process_model(
@@ -1976,7 +2588,7 @@ def process_model(
         True if model is valid; otherwise False.
     """
     pid = record['id'][0]
-    
+
     # Source data may supply either the model's display name (e.g. "Page")
     # or its taxonomy term ID (e.g. "17") - both are valid inputs throughout
     # this pipeline (see also the similar name-or-ID check in remove_pages).
@@ -1985,14 +2597,13 @@ def process_model(
     model_mapping = MODEL_MAPPING.get(value)
 
     if not model_mapping:
-        mask = (
-            (TAXONOMIES['Term ID'] == value)
-            & (TAXONOMIES['Vocabulary'] == 'Islandora Models')
+        model_name = (
+            get_taxonomy_lookup()
+            .id_to_name
+            .get('Islandora Models', {})
+            .get(value)
         )
-        matching_rows = TAXONOMIES.loc[mask]
-
-        if not matching_rows.empty:
-            model_name = matching_rows.iloc[0]['Name']
+        if model_name is not None:
             model_mapping = MODEL_MAPPING.get(model_name)
 
     if model_mapping is None:
@@ -2031,6 +2642,7 @@ def process_record(
     result: ProcessingResult,
     row: pd.Series,
     index: int,
+    id_column: str,
 ) -> dict | None:
     """Transform a raw CSV row into a structured metadata record.
 
@@ -2038,6 +2650,7 @@ def process_record(
         result: Runtime processing result.
         row: Source row.
         index: Row index.
+        id_column: Column that holds the record identifier.
 
     Returns:
         Processed record, or None if processing fails.
@@ -2045,17 +2658,15 @@ def process_record(
     # Setup record
     record = initialize_record()
 
-    # Find the first key that exists in the row's index
-    valid_key = next((k for k in IDENTIFIERS if k in row.index), None)
-
-    pid = row[valid_key] if valid_key else None
+    # Read the record identifier from the designated column
+    pid = row[id_column] if id_column in row.index else None
     pid = remove_whitespaces(str(pid)) if pd.notna(pid) else None
 
     if not pid:
         msg = f"row {index} missing required identifier"
         result.log_issue(
             'UNKNOWN',
-            'identifier',
+            id_column,
             None,
             msg,
             f"{msg.capitalize()}.",
@@ -2141,6 +2752,61 @@ def process_record(
     return record
 
 
+def log_family_issues(
+    result: ProcessingResult,
+    pid: str,
+    position: int,
+    family_order: FamilyOrder,
+    failed_keys: set[str],
+) -> None:
+    """Report parent/child problems found while ordering records.
+
+    The record is still written in every case; these are issues to review.
+
+    Args:
+        result: Runtime processing result.
+        pid: PID of the record being processed.
+        position: Position of the record in the reordered sheet.
+        family_order: Result of ordering the records by family.
+        failed_keys: Identifiers of records that failed to process.
+    """
+    parent = family_order.parents[position]
+
+    if position in family_order.circular:
+        result.log_issue(
+            pid,
+            'parent_id',
+            parent,
+            "circular parent_id reference",
+            (
+                f"parent_id '{parent}' leads back to this record. The record "
+                "was written, but it cannot be ordered after its parent."
+            ),
+        )
+    elif position in family_order.unresolved_parents:
+        result.log_issue(
+            pid,
+            'parent_id',
+            parent,
+            "parent not found in the ingest sheet",
+            (
+                f"Parent '{parent}' was not found in the ingest sheet. The "
+                "record was written anyway."
+            ),
+        )
+    elif parent and parent in failed_keys:
+        result.log_issue(
+            pid,
+            'parent_id',
+            parent,
+            "parent record failed to process",
+            (
+                f"Parent '{parent}' failed to process and is not in the "
+                "ingest file. The record was written anyway."
+            ),
+        )
+
+
 def process_files(
     export_df: pd.DataFrame,
     metadata_df: pd.DataFrame,
@@ -2159,19 +2825,41 @@ def process_files(
         True if processing completes; otherwise False.
     """
     logger = logging.getLogger(LOGGER_NAME)
+    completed = False
 
     try:
-
+        # Confirm the identifier column exists in the metadata sheet
+        if not metadata_df.empty:
+            validate_id_column(metadata_df, config.id_column)
+            logger.info(
+                "Using '%s' as the identifier column.",
+                config.id_column,
+            )
 
         # Merge export and metadata sheets
         if not export_df.empty and not metadata_df.empty:
             ingest_sheet, unmatched_records = merge_sheets(
                 export_df,
-                metadata_df
+                metadata_df,
+                config.id_column,
             )
         else:
             ingest_sheet = metadata_df
             unmatched_records = pd.DataFrame()
+            
+        # Write unmatched rows immediately, before any validation can stop
+        # the run, so the report is always available for troubleshooting
+        unmatched_log_csv = None
+
+        if not unmatched_records.empty:
+            unmatched_log_csv = (
+                config.log_dir / f'{config.file_prefix}_unmatched.csv'
+            )
+            logger.warning(
+                "Unmatched rows found, writing to %s.",
+                unmatched_log_csv,
+            )
+            df_to_csv(unmatched_records, unmatched_log_csv)
 
         # Confirm that ingest sheet contains node_ids for update task
         if config.ingest_task == 'update':
@@ -2196,6 +2884,10 @@ def process_files(
                     f"Update ingest contains {int(blank_node_ids.sum())} "
                     "record(s) without a node_id."
                 )
+
+                if unmatched_log_csv:
+                    message += f" See unmatched report: {unmatched_log_csv}"
+
                 logger.error(message)
                 raise ValueError(message)
 
@@ -2209,16 +2901,6 @@ def process_files(
         # Remove Page objects
         elif config.remove_pages:
             ingest_sheet = remove_pages(ingest_sheet, logger)
-
-        if not unmatched_records.empty:
-            unmatched_log_csv = (
-                config.log_dir / f'{config.file_prefix}_unmatched.csv'
-            )
-            logger.warning(
-                "Unmatched rows found, writing to %s.",
-                unmatched_log_csv,
-            )
-            df_to_csv(unmatched_records, unmatched_log_csv)
 
         # Process Batch
         buffer = []
@@ -2241,29 +2923,65 @@ def process_files(
                     buffer.clear()
 
         else:
-            for idx, row in tqdm(
-                ingest_sheet.iterrows(),
-                total=len(ingest_sheet),
-                desc="Processing Records",
-                unit='record',
+            # Order rows so parents precede children and families stay whole
+            family_order = order_records_by_family(
+                ingest_sheet,
+                config.id_column,
+                use_hierarchy=True,
+            )
+            ingest_sheet = family_order.sheet
+            failed_keys = set()
+
+            for position, (idx, row) in enumerate(
+                tqdm(
+                    ingest_sheet.iterrows(),
+                    total=len(ingest_sheet),
+                    desc="Processing Records",
+                    unit='record',
+                )
             ):
-                record = process_record(result, row, idx)
+                record = process_record(result, row, idx, config.id_column)
 
                 if record:
+                    log_family_issues(
+                        result,
+                        record['id'][0],
+                        position,
+                        family_order,
+                        failed_keys,
+                    )
                     record = validate_record(
                         result,
                         record,
                         ingest_sheet,
                         config.ingest_task,
+                        config.id_column,
                     )
                     record = format_record(record)
                     buffer.append(record)
                 else:
                     result.increment_failure_count()
-                    continue
 
-                # Complete batch if max size reached
-                if should_flush_batch(buffer, config.batch_size):
+                    if family_order.keys[position]:
+                        failed_keys.add(family_order.keys[position])
+
+                # Complete batch once the size is reached, but only at the
+                # end of a family so parents and children are never split
+                if (
+                    buffer
+                    and family_order.family_end[position]
+                    and should_flush_batch(buffer, config.batch_size)
+                ):
+                    if len(buffer) > config.batch_size:
+                        logger.info(
+                            "Batch %d has %d records, more than the batch "
+                            "size of %d, to keep parent and child records "
+                            "together.",
+                            result.current_batch,
+                            len(buffer),
+                            config.batch_size,
+                        )
+
                     flush_batch(
                         buffer,
                         result.current_batch,
@@ -2281,13 +2999,7 @@ def process_files(
                 config,
             )
 
-        write_reports(
-            config.log_dir,
-            config.timestamp,
-            'metadata',
-            result.transformations,
-            result.issues
-        )
+        completed = True
 
         return True
 
@@ -2301,6 +3013,57 @@ def process_files(
 
         return False
 
+    finally:
+        # Write the issue and transformation reports even if processing
+        # stopped early, so the findings collected so far aren't lost. When
+        # the run failed before anything was collected, skip the reports to
+        # avoid a misleading "no exceptions" message.
+        if completed or result.issues or result.transformations:
+            try:
+                write_reports(
+                    config.log_dir,
+                    config.timestamp,
+                    'metadata',
+                    result.transformations,
+                    result.issues
+                )
+            except Exception:
+                logger.exception("Failed to write processing reports.")
+
+
+def check_taxonomy_cache_age(logger: logging.Logger) -> None:
+    """Report how old the taxonomy cache is, and warn when it is stale.
+
+    Terms added in Drupal after the last refresh are reported as missing, so
+    an old cache produces misleading results.
+
+    Args:
+        logger: Run logger.
+    """
+    age = get_taxonomy_cache_age()
+
+    if age is None:
+        message = (
+            "Could not determine when the taxonomy cache was last "
+            "refreshed."
+        )
+        logger.warning("%s", message)
+        print(f"\n{WARNING_SYMBOL} {message}")
+
+        return
+
+    message = f"The taxonomy cache was last refreshed {age.days} day(s) ago."
+
+    if age.days > TAXONOMY_CACHE_MAX_AGE_DAYS:
+        message += (
+            " Terms added in Drupal since then will be reported as missing. "
+            "Refresh it with refresh_taxonomies.py or --refresh_taxonomies."
+        )
+        logger.warning("%s", message)
+        print(f"\n{WARNING_SYMBOL} {message}")
+    else:
+        logger.info("%s", message)
+        
 
 def main() -> None:
     """Run the metadata ingest generation workflow."""
@@ -2337,6 +3100,13 @@ def main() -> None:
             logger=logger,
         )
 
+        # Warn if the shared taxonomy cache is out of date
+        check_taxonomy_cache_age(logger)
+
+        # Index the loaded taxonomies for fast term validation
+        get_taxonomy_lookup.cache_clear()
+        get_taxonomy_lookup()
+
         result = ProcessingResult()
 
         # Convert export and metadata sheets to DataFrames
@@ -2369,6 +3139,21 @@ def main() -> None:
 
         sys.exit(1)
 
+    # A run that stopped early is a failure regardless of how many records
+    # had already failed individually
+    if not success:
+        msg = "Processing did not complete successfully."
+
+        if critical_failures_count > 0:
+            unit = "record" if critical_failures_count == 1 else "records"
+            msg += (
+                f" {critical_failures_count} {unit} failed before the run "
+                "stopped."
+            )
+
+        logger.error("%s", msg)
+        sys.exit(1)
+
     if critical_failures_count > 0:
         unit = "record" if critical_failures_count == 1 else "records"
         msg = f"{critical_failures_count} {unit} failed to process."
@@ -2377,13 +3162,10 @@ def main() -> None:
             f"\n{WARNING_SYMBOL} {msg}",
             f" See logs: {config.log_path}" if config.log_path else ""
         )
-    elif success:
+    else:
         msg = "All records were processed successfully."
         logger.info("%s", msg)
         print(f"\n{SUCCESS_SYMBOL} {msg}")
-    elif not success:
-        logger.error("Processing did not complete successfully.")
-        sys.exit(1)
 
 
 if __name__ == '__main__':
