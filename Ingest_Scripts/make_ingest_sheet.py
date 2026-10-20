@@ -1828,13 +1828,8 @@ def add_value(
         if stored is None:
             values.append(value)
         elif value.prefix and not getattr(stored, 'prefix', ''):
-            # A bare form is stored; the prefixed form just arrived and
-            # takes precedence, so replace the bare entry.
             values[values.index(stored)] = value
-        # else: the incoming value is bare while a prefixed form is already
-        # stored, it exactly repeats the stored value, or both are
-        # differently prefixed variants (keep whichever was seen first).
-        # In every case, drop the incoming value.
+
     record[field] = values
 
     return value
