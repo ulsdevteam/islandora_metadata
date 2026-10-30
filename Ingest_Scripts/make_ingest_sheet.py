@@ -856,10 +856,9 @@ def order_records_by_family(
 
     Workbench can only resolve a ``parent_id`` that refers to an ``id``
     earlier in the same CSV, so each top-level record is followed directly
-    by all of its descendants. Siblings are ordered by ``field_weight``
-    when any of them has one, with unweighted siblings after the weighted
-    ones in sheet order. When none of the siblings has a ``field_weight``,
-    they are ordered by ``node_id`` instead, then by sheet order.
+    by all of its descendants. Siblings are ordered by ``field_weight``,
+    with unweighted siblings after the weighted ones. Siblings with equal
+    or no weights keep their sheet order.
 
     A record whose ``parent_id`` matches nothing in the sheet (for example,
     a child of an object that already exists in Drupal) is treated as the
@@ -913,7 +912,6 @@ def order_records_by_family(
     keys = cleaned_column(id_column)
     models = cleaned_column('field_model')
     weights = numeric_column('field_weight')
-    node_ids = numeric_column('node_id')
 
     # parent_id is repeatable in the schema, but a record has one parent
     parents = []
@@ -941,18 +939,12 @@ def order_records_by_family(
             children.setdefault(parent, []).append(position)
 
     def order_siblings(positions: list[int]) -> list[int]:
-        """Order a group of siblings by weight, or else by node ID."""
-        sort_values = (
-            weights
-            if any(not pd.isna(weights[p]) for p in positions)
-            else node_ids
-        )
-
+        """Order a group of siblings by weight, then by sheet position."""
         return sorted(
             positions,
             key=lambda p: (
-                pd.isna(sort_values[p]),
-                0 if pd.isna(sort_values[p]) else sort_values[p],
+                pd.isna(weights[p]),
+                0 if pd.isna(weights[p]) else weights[p],
                 p,
             ),
         )
