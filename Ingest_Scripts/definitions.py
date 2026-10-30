@@ -360,13 +360,41 @@ RELATOR_TERMS = csv_to_dict(
 )
 
 # Taxonomy cache files
+#
+# Everyone who runs these scripts shares one taxonomy cache, so it can live in
+# a common directory set with TAXONOMY_CACHE_DIR in the .env file. When the
+# setting is absent, the cache stays in Utility_Files.
+_taxonomy_cache_dir = os.getenv('TAXONOMY_CACHE_DIR')
+
+TAXONOMY_CACHE_DIR = (
+    Path(_taxonomy_cache_dir).expanduser()
+    if _taxonomy_cache_dir
+    else UTILITY_FILES_DIR
+)
+
 TAXONOMY_CACHE_PATH = (
-    UTILITY_FILES_DIR / 'taxonomies.csv'
+    TAXONOMY_CACHE_DIR / 'taxonomies.csv'
 )
 
 TAXONOMY_CACHE_METADATA_PATH = (
-    UTILITY_FILES_DIR / 'taxonomies_cache_metadata.json'
+    TAXONOMY_CACHE_DIR / 'taxonomies_cache_metadata.json'
 )
+
+# Refresh logs go beside a shared cache, so anyone who can refresh it can also
+# write the logs
+TAXONOMY_LOG_DIR = (
+    TAXONOMY_CACHE_DIR / 'logs'
+    if _taxonomy_cache_dir
+    else PROJECT_ROOT / 'logs'
+)
+
+# Number of days after which the taxonomy cache is reported as stale
+try:
+    TAXONOMY_CACHE_MAX_AGE_DAYS = int(
+        os.getenv('TAXONOMY_CACHE_MAX_AGE_DAYS', '14')
+    )
+except ValueError:
+    TAXONOMY_CACHE_MAX_AGE_DAYS = 14
 
 
 # ---------------------------------------------------------------------------

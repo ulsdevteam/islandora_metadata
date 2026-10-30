@@ -25,6 +25,9 @@ columns_with_term_names:
  - field_temporal_subject
 #additional_files:
 # - transcript: 9
+# - thumbnail: 8
+# - hocr: 41
+# - extracted_text: 2
 #validate_terms_exist: false
 #allow_adding_terms: true
 #log_term_creation: false

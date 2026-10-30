@@ -7,15 +7,23 @@
 # ---------------------------------------------------------------------------
 
 # Standard library imports
+import contextlib
 import json
 import logging
 import os
+import socket
+import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import unescape
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+try:
+    import fcntl
+except ImportError:  # Not available on Windows
+    fcntl = None
 
 # Third-party imports
 import pandas as pd
@@ -42,6 +50,10 @@ from utilities import (
 # ---------------------------------------------------------------------------
 
 DEFAULT_TAXONOMY_URL = os.getenv('TAXONOMY_API_URL')
+
+# Cache files are shared between users, so they are readable and writable by
+# the owner and group
+CACHE_FILE_MODE = 0o664
 DEFAULT_PAGE_SIZE = 1000
 DEFAULT_FETCH_DELAY = 1.5
 DEFAULT_TIMEOUT = 60
@@ -95,6 +107,10 @@ TAXONOMY_SHEET_GIDS: dict[str, int] = {
 # Classes
 # ---------------------------------------------------------------------------
 
+class RefreshInProgressError(RuntimeError):
+    """Raised when another taxonomy refresh already holds the refresh lock."""
+
+
 @dataclass
 class TaxonomyManager:
     """Manage taxonomy retrieval, normalization, caching, and loading.
@@ -102,11 +118,15 @@ class TaxonomyManager:
     Basic Auth credentials may be passed directly with ``username`` and
     ``password`` or supplied through the ``ISLANDORA_USERNAME`` and
     ``ISLANDORA_PASSWORD`` environment variables.
+
+    The taxonomy API URL (``TAXONOMY_API_URL``) is only needed to refresh the
+    cache. Loading from an existing cache works without it.
     """
 
     cache_path: str | Path
     metadata_path: str | Path
-    base_url: str = DEFAULT_TAXONOMY_URL
+    lock_path: str | Path | None = None
+    base_url: str | None = DEFAULT_TAXONOMY_URL
     page_size: int = DEFAULT_PAGE_SIZE
     delay: float = DEFAULT_FETCH_DELAY
     timeout: int = DEFAULT_TIMEOUT
@@ -122,7 +142,14 @@ class TaxonomyManager:
         """Normalize paths and validate configuration."""
         self.cache_path = Path(self.cache_path)
         self.metadata_path = Path(self.metadata_path)
-
+        self.lock_path = (
+            Path(self.lock_path) 
+            if self.lock_path 
+            else self.cache_path.with_name(
+                f'{self.cache_path.stem}_refresh.lock'
+            )
+        )
+        
         self.username = (
             self.username
             or os.getenv('ISLANDORA_USERNAME')
@@ -147,12 +174,6 @@ class TaxonomyManager:
             if credentials_file
             else None
         )
-
-        if not self.base_url:
-            raise ValueError(
-                "Taxonomy API URL is missing. Set TAXONOMY_API_URL "
-                "in the project .env file."
-            )
 
         if self.sheet_gids is None:
             self.sheet_gids = TAXONOMY_SHEET_GIDS.copy()
@@ -217,9 +238,32 @@ class TaxonomyManager:
     ) -> pd.DataFrame:
         """Refresh the taxonomy cache from the REST export.
 
+        Only one refresh can run at a time. If another is already running,
+        this stops immediately instead of waiting, since the refresh already
+        under way will produce the same result.
+
         Args:
             sync_google_sheet: Whether to synchronize the configured Google Sheet
                 after refreshing the local cache.
+
+        Returns:
+            Fresh taxonomy DataFrame.
+
+        Raises:
+            RefreshInProgressError: If another refresh is already running.
+        """
+        with self._refresh_lock():
+            return self._refresh_locked(sync_google_sheet)
+
+    def _refresh_locked(
+        self,
+        sync_google_sheet: bool,
+    ) -> pd.DataFrame:
+        """Refresh the cache. The caller must hold the refresh lock.
+
+        Args:
+            sync_google_sheet: Whether to synchronize the configured
+                Google Sheet after refreshing the local cache.
 
         Returns:
             Fresh taxonomy DataFrame.
@@ -296,6 +340,27 @@ class TaxonomyManager:
 
         return taxonomy_df
 
+    def _require_base_url(self) -> str:
+        """Return the taxonomy API URL, or raise if it isn't configured.
+
+        The URL is only needed when fetching from the REST export, so it is
+        checked here rather than when the manager is created. That lets runs
+        that only read the local cache work without it.
+
+        Returns:
+            The configured taxonomy API URL.
+
+        Raises:
+            ValueError: If no taxonomy API URL is configured.
+        """
+        if not self.base_url:
+            raise ValueError(
+                "Taxonomy API URL is missing. Set TAXONOMY_API_URL "
+                "in the project .env file."
+            )
+
+        return self.base_url
+
     def fetch_all_records(
         self,
     ) -> tuple[list[dict[str, Any]], int]:
@@ -304,6 +369,8 @@ class TaxonomyManager:
         Returns:
             Tuple containing all records and the number of pages fetched.
         """
+        self._require_base_url()
+
         self._log(
             logging.INFO,
             "Connecting to the taxonomy REST export.",
@@ -375,7 +442,7 @@ class TaxonomyManager:
             Taxonomy records for the requested page.
         """
         response = session.get(
-            self.base_url,
+            self._require_base_url(),
             params={'page': page},
             timeout=self.timeout,
         )
@@ -535,12 +602,16 @@ class TaxonomyManager:
         create_directory(self.cache_path.parent)
         create_directory(self.metadata_path.parent)
 
-        temporary_cache = self.cache_path.with_suffix(
-            f'{self.cache_path.suffix}.tmp'
-        )
+        # Write to a temporary file that belongs only to this process, then
+        # swap it into place so readers never see a partial cache
+        temporary_cache = self._temporary_path(self.cache_path)
 
-        df_to_csv(taxonomy_df, temporary_cache)
-        temporary_cache.replace(self.cache_path)
+        try:
+            df_to_csv(taxonomy_df, temporary_cache)
+            os.chmod(temporary_cache, CACHE_FILE_MODE)
+            temporary_cache.replace(self.cache_path)
+        finally:
+            temporary_cache.unlink(missing_ok=True)
 
         cache_metadata = {
             'last_refreshed': (
@@ -551,15 +622,17 @@ class TaxonomyManager:
             # 'source_url': self.base_url,
         }
 
-        temporary_metadata = self.metadata_path.with_suffix(
-            f'{self.metadata_path.suffix}.tmp'
-        )
-
-        temporary_metadata.write_text(
-            json.dumps(cache_metadata, indent=2),
-            encoding='utf-8',
-        )
-        temporary_metadata.replace(self.metadata_path)
+        temporary_metadata = self._temporary_path(self.metadata_path)
+        
+        try:
+            temporary_metadata.write_text(
+                json.dumps(cache_metadata, indent=2),
+                encoding='utf-8',
+            )
+            os.chmod(temporary_metadata, CACHE_FILE_MODE)
+            temporary_metadata.replace(self.metadata_path)
+        finally:
+            temporary_metadata.unlink(missing_ok=True)
 
         self._log(
             logging.INFO,
@@ -584,6 +657,101 @@ class TaxonomyManager:
         return json.loads(
             self.metadata_path.read_text(encoding='utf-8')
         )
+
+    def cache_age(self) -> timedelta | None:
+        """Return how long ago the taxonomy cache was last refreshed.
+
+        Returns:
+            Time since the last refresh, or None if it can't be determined.
+        """
+        try:
+            refreshed = datetime.fromisoformat(
+                self.read_cache_metadata()['last_refreshed']
+            )
+        except (KeyError, ValueError, OSError):
+            return None
+
+        return datetime.now(refreshed.tzinfo) - refreshed
+
+    @staticmethod
+    def _temporary_path(path: Path) -> Path:
+        """Create a uniquely named temporary file beside a target file.
+
+        Args:
+            path: File the temporary file will eventually replace.
+
+        Returns:
+            Path of the new, empty temporary file.
+        """
+        descriptor, name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f'{path.name}.',
+            suffix='.tmp',
+        )
+        os.close(descriptor)
+
+        return Path(name)
+
+    @contextlib.contextmanager
+    def _refresh_lock(self) -> Iterator[None]:
+        """Hold an exclusive lock so only one refresh runs at a time.
+
+        The lock belongs to the running process, so the operating system
+        releases it even if the process crashes. A leftover lock file never
+        blocks later refreshes.
+
+        Raises:
+            RefreshInProgressError: If another refresh holds the lock.
+        """
+        create_directory(self.lock_path.parent)
+
+        if fcntl is None:
+            self._log(
+                logging.WARNING,
+                "File locking is not available on this system; refreshes "
+                "are not protected against running at the same time.",
+            )
+            yield
+            return
+
+        descriptor = os.open(
+            self.lock_path,
+            os.O_RDWR | os.O_CREAT,
+            CACHE_FILE_MODE,
+        )
+
+        # Other users need to open the same lock file
+        with contextlib.suppress(PermissionError):
+            os.chmod(self.lock_path, CACHE_FILE_MODE)
+
+        with os.fdopen(descriptor, 'r+') as lock_file:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                holder = lock_file.read().strip() or 'unknown'
+                raise RefreshInProgressError(
+                    "Another taxonomy refresh is already running "
+                    f"({holder}). Try again shortly."
+                ) from error
+
+            try:
+                # Record who holds the lock, for anyone who is turned away
+                started = datetime.now().astimezone().isoformat(
+                    timespec='seconds'
+                )
+                lock_file.seek(0)
+                lock_file.truncate()
+                lock_file.write(
+                    f"pid {os.getpid()} on {socket.gethostname()} "
+                    f"since {started}"
+                )
+                lock_file.flush()
+
+                yield
+            finally:
+                lock_file.seek(0)
+                lock_file.truncate()
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     @staticmethod
     def clean_value(value: Any) -> str:
@@ -853,6 +1021,15 @@ TAXONOMY_MANAGER = TaxonomyManager(
 
 
 TAXONOMIES = pd.DataFrame()
+
+
+def get_taxonomy_cache_age() -> timedelta | None:
+    """Return how long ago the shared taxonomy cache was last refreshed.
+
+    Returns:
+        Time since the last refresh, or None if it can't be determined.
+    """
+    return TAXONOMY_MANAGER.cache_age()
 
 
 def load_taxonomies(
