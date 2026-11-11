@@ -377,13 +377,20 @@ RELATOR_TERMS = csv_to_dict(
 # Everyone who runs these scripts shares one taxonomy cache, so it can live in
 # a common directory set with TAXONOMY_CACHE_DIR in the .env file. When the
 # setting is absent, the cache stays in Utility_Files.
-_taxonomy_cache_dir = os.getenv('TAXONOMY_CACHE_DIR')
+#
+# A blank or whitespace-only value counts as unset. This is a truthiness test
+# on purpose: an empty string would otherwise become the current directory.
+# A relative path is resolved against the project folder, so every user gets
+# the same location whichever directory they run the scripts from.
+_taxonomy_cache_dir = (os.getenv('TAXONOMY_CACHE_DIR') or '').strip()
 
-TAXONOMY_CACHE_DIR = (
-    Path(_taxonomy_cache_dir).expanduser()
-    if _taxonomy_cache_dir
-    else UTILITY_FILES_DIR
-)
+if _taxonomy_cache_dir:
+    TAXONOMY_CACHE_DIR = Path(_taxonomy_cache_dir).expanduser()
+
+    if not TAXONOMY_CACHE_DIR.is_absolute():
+        TAXONOMY_CACHE_DIR = PROJECT_ROOT / TAXONOMY_CACHE_DIR
+else:
+    TAXONOMY_CACHE_DIR = UTILITY_FILES_DIR
 
 TAXONOMY_CACHE_PATH = (
     TAXONOMY_CACHE_DIR / 'taxonomies.csv'
