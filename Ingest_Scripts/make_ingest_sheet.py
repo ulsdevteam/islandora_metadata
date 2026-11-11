@@ -326,8 +326,10 @@ class MappingResolution:
 class FamilyOrder:
     """Ingest sheet rows arranged so parents precede their children.
 
-    All per-row lists and dictionaries use positions in the reordered
-    ``sheet``, not the original row order.
+    Item N of each list describes row N of the reordered ``sheet``. The two
+    sets hold row positions in that same reordered sheet, not in the original
+    row order. They are only ever used to ask whether a row is in the set, so
+    their iteration order is never relied on.
     """
 
     # Ingest sheet in processing order
@@ -342,10 +344,10 @@ class FamilyOrder:
     # Cleaned parent identifier for each row ('' for top-level rows)
     parents: list[str] = field(default_factory=list)
 
-    # Rows whose parent_id matches no record in the sheet
+    # Positions of rows whose parent_id matches no record in the sheet
     unresolved_parents: set[int] = field(default_factory=set)
 
-    # Rows caught in a circular parent_id reference
+    # Positions of rows caught in a circular parent_id reference
     circular: set[int] = field(default_factory=set)
 
 
@@ -1010,6 +1012,9 @@ def order_records_by_family(
     for family in families:
         family_end.extend([False] * (len(family) - 1) + [True])
 
+    # The positions found above refer to the original row order. Translate
+    # them to positions in the reordered sheet, which is what FamilyOrder
+    # reports.
     new_position = {original: new for new, original in enumerate(order)}
 
     return FamilyOrder(
