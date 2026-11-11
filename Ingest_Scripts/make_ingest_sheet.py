@@ -967,7 +967,6 @@ def order_records_by_family(
 
     families = []
     unresolved = set()
-    emitted_orphan_groups = set()
 
     for position in range(row_count):
         parent = parents[position]
@@ -979,11 +978,10 @@ def order_records_by_family(
         elif parent not in first_position:
             # Parent is not in this sheet. Records that share a missing
             # parent are siblings, so order them together, at the point
-            # where the first of them appears.
-            if parent in emitted_orphan_groups:
+            # where the first of them appears. The first member placed
+            # takes the whole group with it, so later members are skipped.
+            if position in visited:
                 continue
-
-            emitted_orphan_groups.add(parent)
 
             for member in order_siblings(children[parent]):
                 unresolved.add(member)
