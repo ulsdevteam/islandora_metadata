@@ -74,12 +74,14 @@ from tqdm import tqdm
 
 # Local imports
 from definitions import (
+    ADDITIONAL_FILE_COLUMNS,
     COMMA_DELIMITED_FIELDS,
     CONTROLLED_FIELDS,
     DATE_FIELDS,
     DISALLOWED_FIELDS_BY_INGEST_TASK,
     DOMAINS,
     FIELDS,
+    FILE_REFERENCE_COLUMNS,
     FORMATTED_FIELDS,
     GOOGLE_CREDENTIALS_FILE,
     LINKED_AGENT_TYPES,
@@ -119,6 +121,7 @@ from utilities import (
     write_reports,
 )
 
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -128,15 +131,6 @@ LOGGER_NAME = LogRegistry.MAKE_INGEST_SHEET
 
 # Object models that are always top-level; any parent_id on these is ignored
 TOP_LEVEL_MODELS = ('Paged Content', 'Compound Object', 'Newspaper')
-
-# Columns holding files for Workbench's additional_files setting. Each one
-# needs a matching commented entry in default_create_config.yml, such as
-# "# - transcript: 9", where the number is the Media Use term ID.
-ADDITIONAL_FILE_COLUMNS = ('transcript', 'thumbnail', 'hocr', 'extracted_text')
-
-# Columns whose values are file paths or URLs for Workbench to fetch. They
-# are not Drupal field values, so the 255-character text limit doesn't apply.
-FILE_REFERENCE_COLUMNS = ('file',) + ADDITIONAL_FILE_COLUMNS
 
 
 # ---------------------------------------------------------------------------
@@ -1537,9 +1531,12 @@ def resolve_agent_data(csv_field: str) -> MappingResolution | None:
 def resolve_column_mapping(csv_field: str) -> MappingResolution:
     """Resolve a source CSV field to its Islandora field mapping.
 
-    Searches the template, manifest, and MARC field mapping tables for the
-    supplied CSV field. If no direct mapping is found, linked-agent fields
-    are handled separately, then fields that are themselves I2 fields.
+    File columns (``FILE_REFERENCE_COLUMNS``) are recognized first. They
+    hold paths or URLs for Workbench, not Drupal field values, so they need
+    no mapping row. Otherwise this searches the template, manifest, and MARC
+    field mapping tables for the supplied CSV field. If no direct mapping is
+    found, linked-agent fields are handled separately, then fields that are
+    themselves I2 fields.
 
     The result depends only on the field name and the mapping tables, which
     are fixed for the run, so it is cached. This function never logs.
@@ -1554,6 +1551,14 @@ def resolve_column_mapping(csv_field: str) -> MappingResolution:
     """
     if csv_field in SCAN_BATCH_DIR_FIELDS:
         return MappingResolution()
+
+    if csv_field in FILE_REFERENCE_COLUMNS:
+        return MappingResolution(
+            mapping=FieldMapping(
+                field=csv_field,
+                repeatable=is_repeatable_field(csv_field),
+            )
+        )
 
     mapping_columns = [
         'machine_name',

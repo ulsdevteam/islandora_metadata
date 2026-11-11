@@ -141,6 +141,19 @@ COMMA_DELIMITED_FIELDS = {
     'field_domain_access',
 }
 
+# Columns that hold files (paths or URLs) for Workbench, not Drupal field
+# values. Those in ADDITIONAL_FILE_COLUMNS are attached as extra media, so each
+# needs a matching commented entry in default_create_config.yml, such as
+# "# - transcript: 9", where the number is the Media Use term ID.
+ADDITIONAL_FILE_COLUMNS = (
+    'transcript',
+    'thumbnail',
+    'hocr',
+    'extracted_text',
+)
+
+FILE_REFERENCE_COLUMNS = ('file',) + ADDITIONAL_FILE_COLUMNS
+
 # --- Ignored Fields During Processing ---
 
 IGNORED_MODS_FIELDS = {
