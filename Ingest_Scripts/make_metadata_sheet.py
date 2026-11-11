@@ -43,6 +43,7 @@ from tqdm import tqdm
 
 # Local imports
 from definitions import (
+    FILE_REFERENCE_COLUMNS,
     MANIFEST_FIELD_MAPPING,
     MARC_FIELD_MAPPING,
     METADATA_AGENT_TYPES,
@@ -208,12 +209,23 @@ def load_reverse_mappings() -> pd.DataFrame:
     removed, but mappings with different prefixes are retained because the
     prefixes may be required to route exported values.
 
+    File columns (``FILE_REFERENCE_COLUMNS``) need no mapping row. Each is
+    carried through under its own name, after the fields from the manifest
+    mapping table.
+
     Returns:
         Combined reverse mapping table.
     """
     mapping_tables = [
         normalize_mapping_table(TEMPLATE_FIELD_MAPPING),
         normalize_mapping_table(MANIFEST_FIELD_MAPPING),
+        pd.DataFrame(
+            {
+                'field': list(FILE_REFERENCE_COLUMNS),
+                'machine_name': list(FILE_REFERENCE_COLUMNS),
+                'prefix': '',
+            }
+        ),
         normalize_mapping_table(MARC_FIELD_MAPPING),
     ]
 
