@@ -129,7 +129,9 @@ from utilities import (
 DEFAULT_BATCH_SIZE = 10000
 LOGGER_NAME = LogRegistry.MAKE_INGEST_SHEET
 
-# Object models that are always top-level; any parent_id on these is ignored
+# Object models that are always top-level (never children of another object);
+# any parent_id on these is ignored. Collection membership is separate and
+# comes from field_member_of. Matched by model name, not term ID.
 TOP_LEVEL_MODELS = ('Paged Content', 'Compound Object', 'Newspaper')
 
 
@@ -914,7 +916,12 @@ def order_records_by_family(
         tokens = split_and_clean(value)
         parents.append(tokens[0] if tokens else '')
 
-    # Top-level models never have a parent, whatever the sheet says
+    # Top-level object models are never children of another object, so any
+    # parent_id on them is ignored. Collection membership is separate: it
+    # comes from field_member_of (an existing collection's node ID), not
+    # parent_id. The check compares the field_model value as written in the
+    # sheet, so it matches model names (for example, "Paged Content"), not
+    # term IDs.
     parents = [
         '' if models[i] in TOP_LEVEL_MODELS else parent
         for i, parent in enumerate(parents)
@@ -1108,9 +1115,9 @@ def save_records(
     # Filter fields to those allowable by ingest task
     records_df = filter_fields(records_df, config.ingest_task)
 
-    # Ensure that parent_id is empty for top-level object models. Records
-    # arrive already ordered with parents before children (see
-    # order_records_by_family), so they are not re-sorted here.
+    # Ensure that parent_id is empty for top-level object models, the same
+    # rule order_records_by_family applies. Records arrive already ordered
+    # with parents before children, so they are not re-sorted here.
     if (
         'parent_id' in records_df.columns
         and 'field_model' in records_df.columns
